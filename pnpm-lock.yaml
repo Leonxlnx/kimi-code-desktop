@@ -17,8 +17,8 @@ importers:
   apps/server:
     dependencies:
       '@agentclientprotocol/sdk':
-        specifier: 0.23.0
-        version: 0.23.0(zod@4.4.3)
+        specifier: 1.2.1
+        version: 1.2.1(zod@4.4.3)
       ws:
         specifier: 8.21.1
         version: 8.21.1
@@ -102,8 +102,8 @@ importers:
 
 packages:
 
-  '@agentclientprotocol/sdk@0.23.0':
-    resolution: {integrity: sha512-wIGDQMSXwhoSPNCJflSQvf4WeSU2Jq1bbPRAwwb49euo9qMcND5Pb80hD7hVfuAwz9ZvvDuzVrNTOZrvKPR9Eg==}
+  '@agentclientprotocol/sdk@1.2.1':
+    resolution: {integrity: sha512-jwYUdOQR7tc+Zfch53VL4JJyUNK/46q03uUTYb+PjECsmnNl94XFXOfYLJ8RBpMNidXd1rpOAVgb0vqD98xImA==}
     peerDependencies:
       zod: ^3.25.0 || ^4.0.0
 
@@ -1279,7 +1279,7 @@ packages:
 
 snapshots:
 
-  '@agentclientprotocol/sdk@0.23.0(zod@4.4.3)':
+  '@agentclientprotocol/sdk@1.2.1(zod@4.4.3)':
     dependencies:
       zod: 4.4.3
 
