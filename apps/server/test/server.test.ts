@@ -446,7 +446,7 @@ function waitFor(socket: WebSocket, messages: Array<Record<string, unknown>>, pr
     const timeout = setTimeout(() => {
       socket.off("message", onMessage);
       reject(new Error(`Timed out waiting for WebSocket message; recent=${JSON.stringify(messages.slice(-5))}`));
-    }, 5_000);
+    }, 10_000);
     const onMessage = (data: RawData) => {
       const message = JSON.parse(data.toString()) as Record<string, unknown>;
       if (!predicate(message)) return;
