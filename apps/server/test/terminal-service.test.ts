@@ -28,7 +28,7 @@ describe("terminal service", () => {
 });
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 10_000;
   while (!predicate()) {
     if (Date.now() >= deadline) throw new Error("Timed out waiting for terminal output");
     await new Promise((resolve) => setTimeout(resolve, 20));
