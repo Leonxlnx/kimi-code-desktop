@@ -331,6 +331,38 @@ describe("orchestration server", () => {
     socket.close();
   });
 
+  it("restarts ACP and resumes the thread after the runtime connection closes", async () => {
+    const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
+    const dataHome = await mkdtemp(join(tmpdir(), "kimi-server-acp-restart-"));
+    await launchServer(serverPath, "45127", dataHome, children);
+    const messages: Array<Record<string, unknown>> = [];
+    const socket = await connect("45127", messages);
+    const bootstrap = waitFor(socket, messages, (message) => message.id === 1);
+    socket.send(JSON.stringify({ id: 1, method: "env.bootstrap", params: {} }));
+    await bootstrap;
+    const created = waitFor(socket, messages, (message) => message.id === 2);
+    socket.send(JSON.stringify({ id: 2, method: "threads.create", params: { cwd: process.cwd() } }));
+    const threadId = ((await created).result as { thread: { threadId: string } }).thread.threadId;
+
+    const failed = waitFor(socket, messages, (message) => {
+      const event = message.payload as { type?: string; payload?: { stopReason?: string } } | undefined;
+      return event?.type === "TurnCompleted" && event.payload?.stopReason === "error";
+    });
+    socket.send(JSON.stringify({ id: 3, method: "threads.sendTurn", params: { threadId, text: "__CLOSE_ACP__" } }));
+    await failed;
+
+    const approval = waitFor(socket, messages, (message) => (message.payload as { type?: string } | undefined)?.type === "ApprovalRequested");
+    socket.send(JSON.stringify({ id: 4, method: "threads.sendTurn", params: { threadId, text: "Continue after reconnect" } }));
+    const request = (await approval).payload as { payload: { requestId: string } };
+    const completed = waitFor(socket, messages, (message) => {
+      const event = message.payload as { type?: string; payload?: { stopReason?: string } } | undefined;
+      return event?.type === "TurnCompleted" && event.payload?.stopReason === "end_turn";
+    });
+    socket.send(JSON.stringify({ id: 5, method: "threads.respondToRequest", params: { threadId, requestId: request.payload.requestId, optionId: "allow-once" } }));
+    await completed;
+    socket.close();
+  });
+
   it("bootstraps onboarding when Kimi CLI is not installed", async () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
     const dataHome = await mkdtemp(join(tmpdir(), "kimi-server-onboarding-"));

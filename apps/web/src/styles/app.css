@@ -471,20 +471,17 @@ button:disabled { opacity: .45; cursor: default; }
 .composer-context-popover > i > b { display: block; width: 100%; height: 100%; transform-origin: left; background: var(--color-accent); }
 .composer-context-popover small { color: var(--color-text-tertiary); font: 10px/1.4 var(--font-mono); }
 .composer-context-popover p { margin: var(--space-2) 0 0; color: var(--color-text-tertiary); font-size: var(--text-xs); line-height: 1.45; }
-.composer-diagnostic { display: flex; align-items: center; gap: var(--space-2); margin: 0 var(--space-3) var(--space-1); border-radius: var(--radius-sm); padding: 7px 8px; background: var(--color-warning-muted); color: var(--color-warning); font-size: var(--text-xs); }
-.composer-diagnostic > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.composer-diagnostic button { display: grid; flex: 0 0 auto; width: 24px; height: 24px; place-items: center; border: 0; border-radius: var(--radius-xs); padding: 0; background: transparent; color: inherit; cursor: pointer; }
-.composer-diagnostic button:hover { background: color-mix(in srgb, var(--color-warning) 12%, transparent); }
 .composer-submit { width: 38px; height: 38px; margin-left: 5px; border: 0; border-radius: 12px; padding: 0; background: var(--color-accent); color: var(--color-on-accent); transition: background var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard), transform var(--duration-normal) var(--ease-standard), box-shadow var(--duration-normal) var(--ease-standard); }
 .composer-submit svg { width: 17px; height: 17px; animation: send-icon-in var(--duration-normal) var(--ease-emphasized); }
 .composer-submit:hover:not(:disabled) { background: var(--color-accent-hover); transform: translateY(-1px); box-shadow: var(--shadow-control); }
 .composer-submit:active:not(:disabled) { transform: scale(.96); }
 .composer-submit:disabled { background: var(--color-surface-3); color: var(--color-text-tertiary); opacity: 1; }
 .composer-stop { border: 1px solid var(--color-border-strong); background: var(--color-surface-3); color: var(--color-text); }
-.composer-run-mode { display: flex; flex: 0 0 auto; gap: 2px; border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: 2px; background: var(--color-canvas); }
-.composer-run-mode button { min-height: 33px; border: 0; border-radius: var(--radius-sm); padding: 0 10px; background: transparent; color: var(--color-text-tertiary); font-size: var(--text-sm); cursor: pointer; }
-.composer-run-mode button:hover { color: var(--color-text); }
-.composer-run-mode button.active { background: var(--color-surface-3); color: var(--color-text); }
+.app-notice { position: fixed; z-index: calc(var(--z-dialog) + 20); right: var(--space-4); bottom: var(--space-4); display: flex; width: min(420px, calc(100vw - 32px)); align-items: center; gap: var(--space-2); border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); padding: 9px 10px; background: var(--color-chrome); box-shadow: var(--shadow-dialog); color: var(--color-text-secondary); font-size: var(--text-sm); animation: menu-in var(--duration-fast) var(--ease-standard); }
+.app-notice > svg { flex: 0 0 auto; color: var(--color-warning); }
+.app-notice > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.app-notice button { display: grid; flex: 0 0 auto; width: 26px; height: 26px; place-items: center; border: 0; border-radius: var(--radius-xs); padding: 0; background: transparent; color: var(--color-text-tertiary); cursor: pointer; }
+.app-notice button:hover { background: var(--color-hover); color: var(--color-text); }
 .mention-menu { display: grid; max-height: 260px; overflow: auto; border-top: 1px solid var(--color-border); background: var(--color-surface-1); }
 .mention-menu button { display: flex; align-items: center; gap: var(--space-2); border: 0; padding: var(--space-2) var(--space-3); background: transparent; color: var(--color-text-secondary); text-align: left; cursor: pointer; }
 .mention-menu button:hover { background: var(--color-hover); color: var(--color-text); }

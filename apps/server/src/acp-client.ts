@@ -16,6 +16,7 @@ export type AcpClientOptions = {
   kimiCodeHome?: string;
   mcpServers?: () => Promise<acp.McpServer[]>;
   onEvent: (event: RuntimeEvent) => void;
+  onClose?: () => void;
 };
 
 export class AcpClient {
@@ -24,6 +25,7 @@ export class AcpClient {
   readonly #approvalBroker: ApprovalBroker;
   #child: ChildProcessWithoutNullStreams | undefined;
   #connection: acp.ClientSideConnection | undefined;
+  #closing = false;
 
   constructor(options: AcpClientOptions) {
     if (!isAbsolute(options.binary)) throw new Error("ACP binary path must be absolute");
@@ -33,6 +35,7 @@ export class AcpClient {
 
   async start(): Promise<acp.InitializeResponse> {
     if (this.#connection) throw new Error("ACP client already started");
+    this.#closing = false;
 
     const child = spawn(this.#options.binary, this.#options.args ?? ["acp"], {
       env: {
@@ -66,9 +69,14 @@ export class AcpClient {
       readTextFile: (params) => this.#readTextFile(params),
       writeTextFile: (params) => this.#writeTextFile(params),
     };
-    this.#connection = new acp.ClientSideConnection(() => client, stream);
+    const connection = new acp.ClientSideConnection(() => client, stream);
+    this.#connection = connection;
+    void connection.closed.then(
+      () => this.#handleConnectionClosed(connection),
+      () => this.#handleConnectionClosed(connection),
+    );
 
-    return this.#connection.initialize({
+    return connection.initialize({
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: {
         fs: { readTextFile: true, writeTextFile: true },
@@ -116,7 +124,11 @@ export class AcpClient {
   }
 
   hasSession(sessionId: string): boolean {
-    return this.#sessionRoots.has(sessionId);
+    return this.isOpen() && this.#sessionRoots.has(sessionId);
+  }
+
+  isOpen(): boolean {
+    return Boolean(this.#connection);
   }
 
   respondToPermission(requestId: string, optionId?: string): void {
@@ -129,16 +141,27 @@ export class AcpClient {
   }
 
   async close(): Promise<void> {
+    this.#closing = true;
     this.#approvalBroker.cancelAll();
     this.#child?.kill();
     await this.#connection?.closed.catch(() => undefined);
     this.#connection = undefined;
     this.#child = undefined;
+    this.#sessionRoots.clear();
+    this.#closing = false;
   }
 
   #agent(): acp.ClientSideConnection {
     if (!this.#connection) throw new Error("ACP client is not started");
     return this.#connection;
+  }
+
+  #handleConnectionClosed(connection: acp.ClientSideConnection): void {
+    if (this.#connection !== connection) return;
+    this.#connection = undefined;
+    this.#child = undefined;
+    this.#sessionRoots.clear();
+    if (!this.#closing) this.#options.onClose?.();
   }
 
   #mcpServers(): Promise<acp.McpServer[]> {

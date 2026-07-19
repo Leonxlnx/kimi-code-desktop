@@ -112,6 +112,7 @@ const queueRunners = new Set<string>();
 const sessionResumes = new Map<string, Promise<SessionConfigOption[]>>();
 let queueWrite: Promise<void> = Promise.resolve();
 let runtime: AcpClient | undefined;
+let runtimeStart: Promise<AcpClient> | undefined;
 let initializeResult: Awaited<ReturnType<AcpClient["start"]>> | undefined;
 let quotaRead: Promise<Awaited<ReturnType<typeof readKimiQuota>>> | undefined;
 let configDefaultsLive = false;
@@ -143,11 +144,20 @@ function reply(socket: WebSocket, requestId: string | number, result?: unknown, 
 }
 
 async function ensureRuntime(): Promise<AcpClient> {
-  if (runtime) return runtime;
+  if (runtime?.isOpen()) return runtime;
+  if (runtimeStart) return runtimeStart;
+  runtimeStart = startRuntime().finally(() => { runtimeStart = undefined; });
+  return runtimeStart;
+}
+
+async function startRuntime(): Promise<AcpClient> {
+  const stale = runtime;
+  runtime = undefined;
+  await stale?.close();
   const currentFile = fileURLToPath(import.meta.url);
   const useFake = process.env.KIMI_FAKE === "1";
   const fakePath = join(dirname(currentFile), currentFile.endsWith(".ts") ? "fake-acp.ts" : "fake-acp.js");
-  runtime = new AcpClient({
+  const client = new AcpClient({
     binary: useFake ? process.execPath : resolveKimiBinary(),
     args: useFake ? (currentFile.endsWith(".ts") ? ["--import", "tsx", fakePath] : [fakePath]) : ["acp"],
     ...(process.env.KIMI_CODE_HOME ? { kimiCodeHome: resolve(process.env.KIMI_CODE_HOME) } : {}),
@@ -159,9 +169,21 @@ async function ensureRuntime(): Promise<AcpClient> {
       ];
     },
     onEvent: (event) => void onRuntimeEvent(event),
+    onClose: () => {
+      if (runtime !== client) return;
+      runtime = undefined;
+      initializeResult = undefined;
+      sessionResumes.clear();
+    },
   });
-  initializeResult = await runtime.start();
-  return runtime;
+  try {
+    initializeResult = await client.start();
+    runtime = client;
+    return client;
+  } catch (error) {
+    await client.close();
+    throw error;
+  }
 }
 
 async function onRuntimeEvent(event: RuntimeEvent): Promise<void> {
@@ -677,6 +699,8 @@ async function shutdown(): Promise<void> {
 }
 
 async function resetRuntime(): Promise<void> {
+  await runtimeStart?.catch(() => undefined);
+  runtimeStart = undefined;
   await runtime?.close();
   runtime = undefined;
   initializeResult = undefined;

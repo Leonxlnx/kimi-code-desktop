@@ -63,6 +63,7 @@ class FakeAgent implements acp.Agent {
   async prompt(params: acp.PromptRequest): Promise<acp.PromptResponse> {
     const session = this.#sessions.get(params.sessionId);
     if (!session) throw new Error("Unknown fake session");
+    if (params.prompt.some((block) => block.type === "text" && block.text === "__CLOSE_ACP__")) process.exit(0);
     const controller = session.controller = new AbortController();
     for (const block of params.prompt) {
       if (block.type === "resource" && !("text" in block.resource)) throw new Error("Fake ACP rejects blob resources");
