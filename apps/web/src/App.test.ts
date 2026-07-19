@@ -1,7 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { ActivityTimeline, activityPreview, applyDraftConfig, clampPanelWidth, compactToolPreview, ComposerConfig, composerPrimaryAction, composerTrigger, contextPercent, dedupeActivityEntries, draftConfigOverrides, filterByTitle, filterRuntimeSessions, findLocalPreviewUrl, floatingMenuPosition, groupProjects, hasBlockingWork, isYoloChoice, modeDescription, normalizeAvailableCommands, normalizeLocalPreviewUrl, normalizeThread, projectTurns, reorderPaths, shouldSubmitPrompt, showSidebarUpdate, subagentRuns, summarizeDiff, thinkingEffortLabel, toggleComposerTrigger, updatePercent, workspaceName, workspaceRelativePath } from "./App";
+import { ActivityTimeline, activityPreview, applyDraftConfig, clampPanelWidth, compactToolPreview, ComposerConfig, composerPrimaryAction, composerTrigger, contextPercent, dedupeActivityEntries, draftConfigOverrides, filterByTitle, filterRuntimeSessions, findLocalPreviewUrl, floatingMenuPosition, groupProjects, hasBlockingWork, isYoloChoice, modeDescription, normalizeAvailableCommands, normalizeLocalPreviewUrl, normalizeThread, presentDiagnostic, projectTurns, promptShortcutMode, reorderPaths, shouldSubmitPrompt, showSidebarUpdate, subagentRuns, summarizeDiff, thinkingEffortLabel, toggleComposerTrigger, updatePercent, workspaceName, workspaceRelativePath } from "./App";
 
 describe("composer send key", () => {
   it("sends on Enter by default and preserves Shift+Enter newlines", () => {
@@ -13,11 +13,23 @@ describe("composer send key", () => {
     expect(shouldSubmitPrompt({ ...enter, ctrlKey: true }, "ctrl-enter")).toBe(true);
   });
 
-  it("uses one primary control for send, stop, queue, and steer", () => {
-    expect(composerPrimaryAction(false, true, "queue")).toBe("send");
-    expect(composerPrimaryAction(true, false, "steer")).toBe("stop");
-    expect(composerPrimaryAction(true, true, "queue")).toBe("queue");
-    expect(composerPrimaryAction(true, true, "steer")).toBe("steer");
+  it("queues with Enter and steers with Ctrl+Enter while a task is running", () => {
+    const enter = { key: "Enter", shiftKey: false, ctrlKey: false, metaKey: false };
+    expect(promptShortcutMode(enter, "ctrl-enter", true)).toBe("queue");
+    expect(promptShortcutMode({ ...enter, ctrlKey: true }, "enter", true)).toBe("steer");
+    expect(promptShortcutMode({ ...enter, metaKey: true }, "enter", true)).toBe("steer");
+    expect(promptShortcutMode({ ...enter, shiftKey: true }, "enter", true)).toBeUndefined();
+  });
+
+  it("uses one primary control for send, stop, and queue", () => {
+    expect(composerPrimaryAction(false, true)).toBe("send");
+    expect(composerPrimaryAction(true, false)).toBe("stop");
+    expect(composerPrimaryAction(true, true)).toBe("queue");
+  });
+
+  it("turns raw connection errors into a recoverable message", () => {
+    expect(presentDiagnostic("ACP connection closed")).toBe("Kimi runtime disconnected. Your next prompt will reconnect automatically.");
+    expect(presentDiagnostic("Workspace path is required")).toBe("Workspace path is required");
   });
 });
 

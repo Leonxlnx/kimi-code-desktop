@@ -119,23 +119,33 @@ function cleanTerminalOutput(text: string): string {
 }
 
 export function shouldSubmitPrompt(event: { key: string; shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }, sendKey: Preferences["sendKey"]): boolean {
-  if (event.key !== "Enter" || event.shiftKey) return false;
-  return sendKey === "enter" || event.ctrlKey || event.metaKey;
+  return promptShortcutMode(event, sendKey, false) !== undefined;
 }
 
-export type ComposerPrimaryAction = "send" | "stop" | "queue" | "steer";
+export function promptShortcutMode(event: { key: string; shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }, sendKey: Preferences["sendKey"], running: boolean): "queue" | "steer" | undefined {
+  if (event.key !== "Enter" || event.shiftKey) return undefined;
+  if (running) return event.ctrlKey || event.metaKey ? "steer" : "queue";
+  return sendKey === "enter" || event.ctrlKey || event.metaKey ? "queue" : undefined;
+}
 
-export function composerPrimaryAction(running: boolean, hasText: boolean, mode: "queue" | "steer"): ComposerPrimaryAction {
+export type ComposerPrimaryAction = "send" | "stop" | "queue";
+
+export function composerPrimaryAction(running: boolean, hasText: boolean): ComposerPrimaryAction {
   if (!running) return "send";
   if (!hasText) return "stop";
-  return mode;
+  return "queue";
 }
 
 function composerPrimaryLabel(action: ComposerPrimaryAction): string {
   if (action === "stop") return "Stop task and clear queue";
-  if (action === "steer") return "Steer active task";
   if (action === "queue") return "Queue after active task";
   return "Send task";
+}
+
+export function presentDiagnostic(message: string): string {
+  return /ACP connection closed|Server disconnected|Server is not connected/i.test(message)
+    ? "Kimi runtime disconnected. Your next prompt will reconnect automatically."
+    : message;
 }
 
 export function hasBlockingWork(threads: Array<Pick<Thread, "running" | "queue" | "approvals">>, draftSending = false): boolean {
@@ -148,6 +158,7 @@ export function showSidebarUpdate(phase: UpdateStatus["phase"]): boolean {
 
 export function App() {
   const supervisor = useRef<ConnectionSupervisor | undefined>(undefined);
+  const submitMode = useRef<"queue" | "steer">("queue");
   const wasConnected = useRef(false);
   const serverRestarting = useRef(false);
   const automaticRestartAttempted = useRef(false);
@@ -206,7 +217,6 @@ export function App() {
   const [previewDraft, setPreviewDraft] = useState("http://localhost:3000");
   const [previewUrl, setPreviewUrl] = useState<string>();
   const [previewRevision, setPreviewRevision] = useState(0);
-  const [sendMode, setSendMode] = useState<"queue" | "steer">("queue");
   const [composerMenuOpen, setComposerMenuOpen] = useState(false);
   const [itemMenu, setItemMenu] = useState<ItemMenu>();
   const [manageDialog, setManageDialog] = useState<ManageDialog>();
@@ -221,9 +231,9 @@ export function App() {
   const agentRuns = useMemo(() => subagentRuns(activeThread), [activeThread]);
   const composerOptions = useMemo(() => activeThread ? activeThread.configOptions : applyDraftConfig(configDefaults, draftConfig), [activeThread, configDefaults, draftConfig]);
   const workBlocksUpdate = hasBlockingWork(threads, draftSending);
-  const primaryComposerAction = composerPrimaryAction(Boolean(activeThread?.running), Boolean(prompt.trim()), sendMode);
+  const primaryComposerAction = composerPrimaryAction(Boolean(activeThread?.running), Boolean(prompt.trim()));
   const previewPanelMode = preferences.railWidth >= 1_080 ? "Wide" : preferences.railWidth >= 760 ? "Desktop" : "Compact";
-  const setDiagnostic = useCallback((message: string) => setDiagnostics((current) => [...current, message].slice(-50)), []);
+  const setDiagnostic = useCallback((message: string) => setDiagnostics((current) => [...current, presentDiagnostic(message)].slice(-50)), []);
   const openExternalLink = useCallback(async (url: string) => {
     try {
       await openExternal(url);
@@ -263,8 +273,12 @@ export function App() {
 
   useEffect(() => { void applyZoom(preferences.zoom); }, [preferences.zoom]);
 
-  useEffect(() => { setSendMode("queue"); }, [activeThreadId, activeThread?.activeTurnId]);
   useEffect(() => { if (!workBlocksUpdate) setUpdateNotice(undefined); }, [workBlocksUpdate]);
+  useEffect(() => {
+    if (!diagnostics.length) return;
+    const timer = window.setTimeout(() => setDiagnostics([]), 8_000);
+    return () => window.clearTimeout(timer);
+  }, [diagnostics]);
 
   useEffect(() => {
     if (!openMenu) return;
@@ -746,10 +760,12 @@ export function App() {
 
   async function send(event: FormEvent) {
     event.preventDefault();
+    const requestedMode = submitMode.current;
+    submitMode.current = "queue";
     const text = prompt.trim();
     if (!text || (!activeThread && !draftChat) || draftSending) return;
     const mentions = [...text.matchAll(/@\{([^}]+)\}/g)].map((match) => match[1]!);
-    const mode = activeThread?.running ? sendMode : "queue";
+    const mode = activeThread?.running ? requestedMode : "queue";
     setPrompt("");
     setFileSuggestions([]);
     setComposerMenuOpen(false);
@@ -1390,8 +1406,7 @@ export function App() {
             onUpdate={(queuedId, text) => updateQueuedPrompt(activeThread.threadId, queuedId, text)}
             onSteer={(queuedId) => steerQueuedPrompt(activeThread.threadId, queuedId)}
           /> : null}
-          <textarea ref={composerInput} aria-label="Task prompt" value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (shouldSubmitPrompt(event, preferences.sendKey)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={activeThread?.running ? (sendMode === "steer" ? "Steer the active task with a new instruction" : "Queue the next instruction") : activeThread?.kind === "chat" || draftChat?.kind === "chat" ? "Message Kimi" : activeThread || draftChat ? "Ask Kimi to work in this project" : "Start a chat first"} disabled={!auth?.authenticated || (!activeThread && !draftChat) || showOnboarding || draftSending} />
-          {diagnostics.length > 0 && <div className="composer-diagnostic" role="status"><WarningCircle /><span>{diagnostics[diagnostics.length - 1]}</span><button type="button" aria-label="Dismiss diagnostic" onClick={() => setDiagnostics([])}><X /></button></div>}
+          <textarea ref={composerInput} aria-label={activeThread?.running ? "Task prompt. Enter queues. Control Enter steers." : "Task prompt"} title={activeThread?.running ? "Enter to queue · Ctrl+Enter to steer" : undefined} value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { const mode = promptShortcutMode(event, preferences.sendKey, Boolean(activeThread?.running)); if (mode) { submitMode.current = mode; event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} placeholder={activeThread?.running ? "Queue the next instruction (Ctrl+Enter to steer)" : activeThread?.kind === "chat" || draftChat?.kind === "chat" ? "Message Kimi" : activeThread || draftChat ? "Ask Kimi to work in this project" : "Start a chat first"} disabled={!auth?.authenticated || (!activeThread && !draftChat) || showOnboarding || draftSending} />
           {commandSuggestions.length > 0 && <div className="mention-menu command-mention-menu" role="listbox" aria-label={promptTrigger?.kind === "skill" ? "Kimi skills" : "Kimi commands"}>
             <small>{promptTrigger?.kind === "skill" ? "Skills from Kimi Code" : "Commands from Kimi Code"}</small>
             {commandSuggestions.map((command) => <button type="button" role="option" aria-selected="false" key={command.name} onClick={() => insertCommand(command)}>{promptTrigger?.kind === "skill" ? <SlidersHorizontal /> : <TerminalWindow />}<span><strong>/{command.name}</strong><small>{command.description}</small></span></button>)}
@@ -1418,7 +1433,6 @@ export function App() {
               </div>
             </div>
             <div className="composer-controls">
-              {activeThread?.running && <div className="composer-run-mode" role="group" aria-label="Prompt delivery"><button className={sendMode === "queue" ? "active" : ""} type="button" aria-pressed={sendMode === "queue"} title="Run after the current task" onClick={() => setSendMode("queue")}>Queue</button><button className={sendMode === "steer" ? "active" : ""} type="button" aria-pressed={sendMode === "steer"} title="Stop the current turn and continue with this instruction" onClick={() => setSendMode("steer")}>Steer</button></div>}
               {(activeThread || draftChat) && <ComposerConfig options={composerOptions} onChange={changeConfig} />}
               <button className={`icon-button primary composer-submit ${primaryComposerAction === "stop" ? "composer-stop" : ""}`} type={primaryComposerAction === "stop" ? "button" : "submit"} aria-label={composerPrimaryLabel(primaryComposerAction)} title={composerPrimaryLabel(primaryComposerAction)} disabled={!auth?.authenticated || (!activeThread && !draftChat) || showOnboarding || draftSending || (primaryComposerAction !== "stop" && !prompt.trim())} onClick={primaryComposerAction === "stop" && activeThread ? () => stopThread(activeThread.threadId) : undefined}>{primaryComposerAction === "stop" ? <Stop weight="fill" /> : <ArrowUp weight="bold" />}</button>
             </div>
@@ -1527,6 +1541,7 @@ export function App() {
         setPreferences((current) => ({ ...current, yoloAcknowledged: true }));
         setConfig(pending.configId, pending.value);
       }} />}
+      {diagnostics.length > 0 && <div className="app-notice" role="status" aria-live="polite"><WarningCircle /><span>{diagnostics[diagnostics.length - 1]}</span><button type="button" aria-label="Dismiss notification" onClick={() => setDiagnostics([])}><X /></button></div>}
     </main>
   );
 }
