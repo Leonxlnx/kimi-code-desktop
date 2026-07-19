@@ -1,0 +1,11 @@
+{
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTb2ZFSThCQTM3b3pmVENIMGVROWYxY21yTk1FSlErc29FSnh5b1NxWXI0bHhnN25FNS9XK2tLK0J0SDJjcXgvNWlwL215TGhqS2ZpbGRDVFp6dzlZZFZkY29jaElkNHdFPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg0NDI1OTIwCWZpbGU6S2ltaSBDb2RlIERlc2t0b3BfMC44LjNfeDY0LXNldHVwLmV4ZQpBQTBkU1psQUdJaXpZUzJydE9UMjgvL1d4Kzk0Y253T0N3YlJBUGNQVzVJUmllQjk3QTNWTlRSZWNRZHRIaElHVlYwdzJtaHpFdW1iRjQvREw2bFhBdz09Cg==",
+      "url": "https://leonxlnx.github.io/kimi-code-desktop/Kimi-Code-Desktop-0.8.3-x64-setup.exe"
+    }
+  },
+  "notes": "Kimi Code Desktop 0.8.3",
+  "version": "0.8.3",
+  "pub_date": "2026-07-19T01:52:02.2861780Z"
+}
