@@ -720,8 +720,8 @@ async function startRuntime(provider: "kimi", instanceId?: string): Promise<Agen
   const runtimeKimiHome = effectiveKimiHome(provider, instanceId);
   const stale = runtimes.get(key);
   if (stale) {
-    await stale.close();
     if (runtimeEventSources.get(key) === stale) runtimeEventSources.delete(key);
+    await stale.close();
     if (runtimes.get(key) === stale) runtimes.delete(key);
   }
   if (shuttingDown) throw new Error("Server is shutting down");
@@ -3347,7 +3347,7 @@ function quotaCachePathFor(key: string, runtimeHome: string): string {
 function canonicalExistingPath(value: string): string {
   const requested = resolve(value);
   try {
-    return realpathSync(requested);
+    return realpathSync.native(requested);
   } catch {
     return requested;
   }
@@ -3373,7 +3373,7 @@ function comparablePath(value: string): string {
   const suffix: string[] = [];
   while (true) {
     try {
-      current = realpathSync(current);
+      current = realpathSync.native(current);
       break;
     } catch {
       const parent = dirname(current);
@@ -3627,8 +3627,8 @@ async function resetRuntimeInstance(provider: ProviderId, instanceId?: string): 
   const starting = runtimeStarts.get(key);
   if (starting) await starting.catch(() => undefined);
   const runtime = runtimes.get(key);
-  if (runtime) await runtime.close();
   if (runtime && runtimeEventSources.get(key) === runtime) runtimeEventSources.delete(key);
+  if (runtime) await runtime.close();
   if (runtimeStarts.get(key) === starting) runtimeStarts.delete(key);
   if (!runtime || runtimes.get(key) === runtime) runtimes.delete(key);
   initializeResults.delete(key);

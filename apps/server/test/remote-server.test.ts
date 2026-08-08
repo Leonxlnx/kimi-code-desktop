@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -11,11 +12,22 @@ import { KIMI_REMOTE_PROTOCOL, KIMI_REMOTE_TOKEN_PREFIX, LEGACY_REMOTE_PROTOCOL,
 describe("remote server", () => {
   let child: ChildProcess | undefined;
   const sockets: WebSocket[] = [];
+  const pathAliases: string[] = [];
 
   afterEach(async () => {
-    for (const socket of sockets) socket.terminate();
-    child?.kill();
-    await new Promise((resolve) => child?.once("exit", resolve) ?? resolve(undefined));
+    for (const socket of sockets.splice(0)) socket.terminate();
+    const activeChild = child;
+    child = undefined;
+    if (activeChild && activeChild.exitCode === null && activeChild.signalCode === null) {
+      const exited = new Promise((resolve) => activeChild.once("exit", resolve));
+      activeChild.kill();
+      await exited;
+    }
+    for (const alias of pathAliases.splice(0)) {
+      await unlink(alias).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+    }
   });
 
   it("pairs, limits methods, reconnects with a device token, and revokes", async () => {
@@ -104,7 +116,7 @@ describe("remote server", () => {
     };
     const standaloneAlias = `kimi-code-chat://${standalone.thread.threadId}`;
     expect(standalone.thread).toMatchObject({ cwd: standaloneAlias, kind: "chat" });
-    expect(JSON.stringify(standalone)).not.toContain(dataHome);
+    expectStringLeavesNotToContain(standalone, privatePathVariants(dataHome));
     const standaloneEvent = await standaloneCreatedEvent;
     expect((standaloneEvent.payload as { payload: { cwd: string } }).payload.cwd).toBe(standaloneAlias);
     const standaloneList = await request(remote, { id: 41, method: "threads.list", params: {} }) as {
@@ -119,15 +131,64 @@ describe("remote server", () => {
     const resumedStandalone = await request(remote, { id: 42, method: "threads.resume", params: {
       threadId: standalone.thread.threadId, sessionId: standalone.thread.sessionId, cwd: standaloneAlias, replay: false,
     } }) as { thread: { cwd: string } };
-    expect(resumedStandalone.thread.cwd).toBe(standaloneAlias);
+    expect(resumedStandalone.thread.cwd, "public chat-alias resume").toBe(standaloneAlias);
     const resumedLegacyStandalone = await request(remote, { id: 43, method: "threads.resume", params: {
       threadId: standalone.thread.threadId,
       sessionId: standalone.thread.sessionId,
       cwd: join(dataHome, "runtime", "chats"),
       replay: false,
     } }) as { thread: { cwd: string } };
-    expect(resumedLegacyStandalone.thread.cwd).toBe(standaloneAlias);
-    expect(JSON.stringify([standaloneEvent, standaloneList, resumedStandalone, resumedLegacyStandalone])).not.toContain(dataHome);
+    expect(resumedLegacyStandalone.thread.cwd, "legacy physical-path resume").toBe(standaloneAlias);
+
+    // A junction/symlink is a deterministic path-alias fixture. GitHub's Windows
+    // runner additionally exercises the native RUNNER~1 (8.3) spelling through
+    // `dataHome`; generating a real 8.3 name is host-policy dependent.
+    const aliasedDataHome = `${dataHome}-alias`;
+    await symlink(dataHome, aliasedDataHome, process.platform === "win32" ? "junction" : "dir");
+    pathAliases.push(aliasedDataHome);
+    const resumedAliasedLegacyStandalone = await request(remote, { id: 430, method: "threads.resume", params: {
+      threadId: standalone.thread.threadId,
+      sessionId: standalone.thread.sessionId,
+      cwd: join(aliasedDataHome, "runtime", "chats"),
+      replay: false,
+    } }) as { thread: { cwd: string } };
+    expect(resumedAliasedLegacyStandalone.thread.cwd, "canonicalized legacy path-alias resume").toBe(standaloneAlias);
+
+    // Both listeners are installed before either result is awaited. This covers
+    // concurrent frame dispatch only after the chat already exists, without
+    // assuming create->resume ordering and without retrying a rejected request.
+    const [pipelinedAliasResume, pipelinedLegacyResume] = await Promise.all([
+      request(remote, { id: 431, method: "threads.resume", params: {
+        threadId: standalone.thread.threadId,
+        sessionId: standalone.thread.sessionId,
+        cwd: standaloneAlias,
+        replay: false,
+      } }) as Promise<{ thread: { cwd: string } }>,
+      request(remote, { id: 432, method: "threads.resume", params: {
+        threadId: standalone.thread.threadId,
+        sessionId: standalone.thread.sessionId,
+        cwd: join(aliasedDataHome, "runtime", "chats"),
+        replay: false,
+      } }) as Promise<{ thread: { cwd: string } }>,
+    ]);
+    expect(pipelinedAliasResume.thread.cwd, "pipelined public chat-alias resume").toBe(standaloneAlias);
+    expect(pipelinedLegacyResume.thread.cwd, "pipelined legacy path-alias resume").toBe(standaloneAlias);
+
+    await expect(request(remote, { id: 433, method: "threads.resume", params: {
+      threadId: standalone.thread.threadId,
+      sessionId: `${standalone.thread.sessionId}-mismatch`,
+      cwd: standaloneAlias,
+      replay: false,
+    } })).rejects.toThrow("[remote request id=433 method=threads.resume] Remote devices can resume only an existing matching Kimi Code thread");
+    expectStringLeavesNotToContain([
+      standaloneEvent,
+      standaloneList,
+      resumedStandalone,
+      resumedLegacyStandalone,
+      resumedAliasedLegacyStandalone,
+      pipelinedAliasResume,
+      pipelinedLegacyResume,
+    ], privatePathVariants(dataHome, aliasedDataHome));
     await request(local, { id: 44, method: "threads.delete", params: { threadId: standalone.thread.threadId } });
     const localOrphanList = await request(local, { id: 440, method: "threads.list", params: {} }) as {
       runtimeSessions: Array<{ sessionId: string; cwd?: string; kind?: string }>;
@@ -239,17 +300,17 @@ describe("remote server", () => {
     });
     const attachmentQueue = await attachmentQueued;
     expect(attachmentQueue[0]?.images).toEqual([{ name: "remote-private-name.png", mimeType: "image/png" }]);
-    expect(JSON.stringify(attachmentQueue)).not.toContain("outside-private-roots");
+    expectStringLeavesNotToContain(attachmentQueue, ["outside-private-roots"]);
     const attachmentStartedEvent = await attachmentStarted;
     expect(attachmentStartedEvent.payload.images).toEqual([{ name: "remote-private-name.png", mimeType: "image/png" }]);
-    expect(JSON.stringify(attachmentStartedEvent)).not.toContain("outside-private-roots");
+    expectStringLeavesNotToContain(attachmentStartedEvent, ["outside-private-roots"]);
     await attachmentCompleted;
     const attachmentList = await request(remote, { id: 29, method: "threads.list", params: {} }) as {
       threads: Array<{ threadId: string; messages: Array<{ images?: Array<{ name: string }> }> }>;
     };
     const attachmentProjection = attachmentList.threads.find((thread) => thread.threadId === attachmentThread.thread.threadId);
     expect(attachmentProjection?.messages.find((message) => message.images?.length)?.images?.[0]?.name).toBe("remote-private-name.png");
-    expect(JSON.stringify(attachmentProjection)).not.toContain("outside-private-roots");
+    expectStringLeavesNotToContain(attachmentProjection, ["outside-private-roots"]);
 
     let quotaError = "";
     try {
@@ -258,8 +319,7 @@ describe("remote server", () => {
       quotaError = error instanceof Error ? error.message : String(error);
     }
     expect(quotaError).toContain("[home]");
-    expect(quotaError).not.toContain(process.cwd());
-    expect(quotaError).not.toContain(process.execPath);
+    expectStringLeavesNotToContain(quotaError, privatePathVariants(process.cwd(), process.execPath));
 
     const privateThread = await request(local, {
       id: 31,
@@ -275,12 +335,10 @@ describe("remote server", () => {
     });
     const privateDiagnosticPayload = (await privateDiagnostic).payload;
     const privateCompletedPayload = (await privateCompleted).payload;
-    for (const projected of [JSON.stringify(privateDiagnosticPayload), JSON.stringify(privateCompletedPayload)]) {
-      expect(projected).not.toContain(process.execPath);
-      expect(projected).not.toContain(privateInstanceHome);
-      expect(projected).not.toContain(privateConfigHome);
-      expect(projected).not.toContain("retired-kimi-instance");
-    }
+    expectStringLeavesNotToContain(
+      [privateDiagnosticPayload, privateCompletedPayload],
+      [...privatePathVariants(process.execPath, privateInstanceHome, privateConfigHome), "retired-kimi-instance"],
+    );
     expect(privateDiagnosticPayload.message).toContain("[home]");
     expect(privateCompletedPayload.error).toContain("[home]");
     const privateList = await request(remote, { id: 33, method: "threads.list", params: {} }) as {
@@ -289,10 +347,10 @@ describe("remote server", () => {
     const privateProjection = privateList.threads.find((thread) => thread.threadId === privateThread.thread.threadId);
     expect(privateProjection?.lifecycle.error).toContain("[home]");
     expect(privateProjection?.turns.at(-1)?.error).toContain("[home]");
-    expect(JSON.stringify(privateProjection)).not.toContain(process.execPath);
-    expect(JSON.stringify(privateProjection)).not.toContain(privateInstanceHome);
-    expect(JSON.stringify(privateProjection)).not.toContain(privateConfigHome);
-    expect(JSON.stringify(privateProjection)).not.toContain("retired-kimi-instance");
+    expectStringLeavesNotToContain(
+      privateProjection,
+      [...privatePathVariants(process.execPath, privateInstanceHome, privateConfigHome), "retired-kimi-instance"],
+    );
 
     const closed = [remote, legacyRemote].map((socket) => new Promise<number>((resolve) => socket.once("close", (code) => resolve(code))));
     await request(local, { id: 7, method: "remote.revokeDevice", params: { deviceId: claimed.device.id } });
@@ -326,8 +384,7 @@ describe("remote server", () => {
       claimError = error instanceof Error ? error.message : String(error);
     }
     expect(claimError).toContain("[home]");
-    expect(claimError).not.toContain(dataHome);
-    expect(claimError).not.toContain(blockedTemporary);
+    expectStringLeavesNotToContain(claimError, privatePathVariants(dataHome, blockedTemporary));
   });
 });
 
@@ -363,18 +420,69 @@ async function waitForCaptured(
 
 function request(socket: WebSocket, input: { id: number; method: string; params: unknown }): Promise<unknown> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { socket.off("message", receive); reject(new Error(`Timed out waiting for ${input.method}`)); }, 8_000);
+    const requestLabel = boundedRequestLabel(input);
+    const timer = setTimeout(() => { socket.off("message", receive); reject(new Error(`Timed out waiting for ${requestLabel}`)); }, 8_000);
     const receive = (data: WebSocket.RawData) => {
       const message = JSON.parse(data.toString()) as { id?: number; result?: unknown; error?: { message?: string } };
       if (message.id !== input.id) return;
       clearTimeout(timer);
       socket.off("message", receive);
-      if (message.error) reject(new Error(message.error.message ?? "Remote request failed"));
+      if (message.error) reject(new Error(`${requestLabel} ${boundedDiagnostic(message.error.message ?? "Remote request failed")}`));
       else resolve(message.result);
     };
     socket.on("message", receive);
     socket.send(JSON.stringify(input));
   });
+}
+
+function boundedRequestLabel(input: { id: number; method: string }): string {
+  return `[remote request id=${String(input.id).slice(0, 32)} method=${input.method.slice(0, 80)}]`;
+}
+
+function boundedDiagnostic(value: string): string {
+  return value.length <= 2_000 ? value : `${value.slice(0, 1_999)}\u2026`;
+}
+
+function privatePathVariants(...paths: string[]): string[] {
+  const variants = new Set<string>();
+  for (const path of paths) {
+    variants.add(path);
+    try {
+      variants.add(realpathSync.native(path));
+    } catch {
+      // Missing paths have no additional canonical spelling to check.
+    }
+  }
+  return [...variants];
+}
+
+function expectStringLeavesNotToContain(value: unknown, forbidden: readonly string[]): void {
+  const leaves: string[] = [];
+  const visited = new WeakSet<object>();
+  const visit = (candidate: unknown): void => {
+    if (typeof candidate === "string") {
+      leaves.push(candidate);
+      return;
+    }
+    if (!candidate || typeof candidate !== "object" || visited.has(candidate)) return;
+    visited.add(candidate);
+    if (Array.isArray(candidate)) {
+      for (const item of candidate) visit(item);
+      return;
+    }
+    for (const item of Object.values(candidate as Record<string, unknown>)) visit(item);
+  };
+  visit(value);
+  for (const [index, privateValue] of [...new Set(forbidden.filter(Boolean))].entries()) {
+    const normalizedPrivateValue = normalizeLeakText(privateValue);
+    const leaked = leaves.some((leaf) => normalizeLeakText(leaf).includes(normalizedPrivateValue));
+    expect(leaked, `private string variant ${index + 1} leaked`).toBe(false);
+  }
+}
+
+function normalizeLeakText(value: string): string {
+  const normalized = value.replaceAll("\\", "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
 }
 
 function waitForPush(socket: WebSocket, channel: string): Promise<{ channel: string; payload: Record<string, unknown> }> {

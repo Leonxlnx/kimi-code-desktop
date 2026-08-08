@@ -5,7 +5,9 @@ import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  apiGetFollowingRedirects,
   apiListPaginated,
+  assertFetchAllowed,
   assertPushSafety,
   buildPlan,
   buildSourcePush,
@@ -21,13 +23,249 @@ import {
   validateManifest,
 } from "./execute-approved-migration.mjs";
 
-const ROOT_MANIFEST = JSON.parse(await readFile(new URL("../dist/migration/2026-08-08/MIGRATION_APPROVAL.json", import.meta.url), "utf8"));
 const FILE_BYTES = new Map([
   ["Kimi-Code-Desktop-0.8.3-x64-setup.exe", Buffer.from("installer\n")],
   ["Kimi-Code-Desktop-0.8.3-x64-setup.exe.sig", Buffer.from("signature\n")],
   ["latest.json", Buffer.from("{\"version\":\"0.8.3\"}\n")],
   ["SHA256SUMS.txt", Buffer.from("fixture checksum\n")],
 ]);
+const ROOT_MANIFEST = syntheticRootManifest();
+
+function syntheticRootManifest() {
+  const sourceMainOld = "1".repeat(40);
+  const sourceMainNew = "2".repeat(40);
+  const sourceMainTree = "3".repeat(40);
+  const sourcePagesOld = "4".repeat(40);
+  const sourcePagesNew = "5".repeat(40);
+  const sourcePagesTree = "6".repeat(40);
+  const oldTagObject = "7".repeat(40);
+  const oldTagCommit = "8".repeat(40);
+  const oldTagTree = "9".repeat(40);
+  const newTagObject = "a".repeat(40);
+  const newTagCommit = "b".repeat(40);
+  const newTagTree = "c".repeat(40);
+  const branchOld = "d".repeat(40);
+  const secondBranchOld = "0d".repeat(20);
+  const userSiteOld = "e".repeat(40);
+  const userSiteNew = "f".repeat(40);
+  const userSiteTree = "0".repeat(40);
+  const releaseAssets = [...FILE_BYTES].map(([name, bytes], index) => ({
+    id: 9000 + index,
+    name,
+    bytes: bytes.length,
+    sha256: sha256(bytes),
+  }));
+
+  return {
+    schemaVersion: 1,
+    generatedAt: "2026-08-08T18:00:00.000Z",
+    approvalRequired: true,
+    approvalFormat: "APPROVE CLEAN-ROOT MIGRATION MANIFEST <sha256-of-this-file>",
+    approvalEligible: true,
+    lastRemoteFreezeAt: "2026-08-08T18:00:00.000Z",
+    lastRemoteFreezeMatched: true,
+    sourceRepository: {
+      repositoryId: 1303365335,
+      nodeId: "R_fixture_source",
+      currentName: "Leonxlnx/tasty-desktop",
+      approvedName: "Leonxlnx/kimi-code-desktop",
+      main: {
+        expectedOld: sourceMainOld,
+        approvedNew: sourceMainNew,
+        approvedTree: sourceMainTree,
+        action: "replace-with-exact-force-with-lease",
+      },
+      ghPages: {
+        expectedOld: sourcePagesOld,
+        approvedNew: sourcePagesNew,
+        approvedTree: sourcePagesTree,
+        action: "fast-forward-only",
+      },
+      "v0.8.3": {
+        expectedOldTagObject: oldTagObject,
+        expectedOldCommit: oldTagCommit,
+        expectedOldTree: oldTagTree,
+        approvedNewTagObject: newTagObject,
+        approvedNewCommit: newTagCommit,
+        approvedNewTree: newTagTree,
+        action: "retarget-with-exact-tag-lease-preserve-release",
+      },
+      branches: [
+        { name: "fixture-update", expectedOld: branchOld, action: "lease-delete" },
+        { name: "fixture-update-two", expectedOld: secondBranchOld, action: "lease-delete" },
+      ],
+      pullRequestsToClose: [
+        {
+          number: 17,
+          nodeId: "PR_fixture_17",
+          state: "open",
+          baseRef: "main",
+          baseSha: sourceMainOld,
+          headRef: "fixture-update",
+          headSha: branchOld,
+        },
+        {
+          number: 18,
+          nodeId: "PR_fixture_18",
+          state: "open",
+          baseRef: "main",
+          baseSha: sourceMainOld,
+          headRef: "fixture-update-two",
+          headSha: secondBranchOld,
+        },
+      ],
+      desiredMetadata: {
+        description: "Kimi Code Desktop fixture repository.",
+        homepage: "https://github.com/Leonxlnx/kimi-code-desktop#readme",
+        topics: ["desktop-app", "kimi", "test-fixture"],
+      },
+      desiredPages: {
+        buildType: "workflow",
+        cname: null,
+        httpsEnforced: true,
+        url: "https://leonxlnx.github.io/kimi-code-desktop/",
+      },
+    },
+    userSiteRepository: {
+      repositoryId: 1123421023,
+      nodeId: "R_fixture_user_site",
+      name: "Leonxlnx/Leonxlnx.github.io",
+      main: {
+        expectedOld: userSiteOld,
+        approvedNew: userSiteNew,
+        approvedTree: userSiteTree,
+        action: "replace-with-exact-force-with-lease",
+      },
+      cname: { decision: "omit" },
+      desiredPages: {
+        buildType: "legacy",
+        source: { branch: "main", path: "/" },
+        cname: null,
+        httpsEnforced: true,
+        url: "https://leonxlnx.github.io/",
+      },
+    },
+    release: {
+      id: 9000,
+      tag: "v0.8.3",
+      preserveRecordAndAssets: true,
+      signatureVerified: true,
+      signatureEvidenceSha256: "a".repeat(64),
+      assets: releaseAssets,
+    },
+    localEvidence: {
+      repositories: {
+        sourceRoot: {
+          path: "fixtures/source-root",
+          branch: "main",
+          commit: sourceMainNew,
+          tree: sourceMainTree,
+          parent: null,
+        },
+        canonicalGhPages: {
+          path: "fixtures/canonical-pages",
+          branch: "gh-pages",
+          commit: sourcePagesNew,
+          tree: sourcePagesTree,
+          parent: sourcePagesOld,
+        },
+        userSite: {
+          path: "fixtures/user-site",
+          branch: "main",
+          commit: userSiteNew,
+          tree: userSiteTree,
+          parent: null,
+        },
+        "sanitizedV0.8.3": {
+          path: "fixtures/sanitized-v0.8.3",
+          branch: "main",
+          commit: newTagCommit,
+          tree: newTagTree,
+          parent: null,
+          tag: "v0.8.3",
+          tagObject: newTagObject,
+        },
+      },
+    },
+    privateBackups: [],
+    prerequisites: {
+      ready: true,
+      releaseFreeze: { required: true, activeReleaseWorkflowRunsAtCapture: [] },
+      requiredEnvironments: ["github-pages", "release-signing", "legacy-update-feed"],
+      requiredVariables: {
+        UPDATER_FEED_MODE: "dual",
+        LEGACY_FEED_REPOSITORY: "Leonxlnx/Leonxlnx.github.io",
+        LEGACY_FEED_APP_ID: "424242",
+      },
+      requiredEnvironmentSecrets: {
+        "release-signing": ["TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"],
+        "legacy-update-feed": ["LEGACY_FEED_APP_PRIVATE_KEY"],
+      },
+      requiredLegacyFeedApp: {
+        installedOnlyOn: "Leonxlnx/Leonxlnx.github.io",
+        permissions: { metadata: "read", contents: "write" },
+      },
+      missingAtCapture: [],
+    },
+    execution: {
+      stateMachineVersion: 1,
+      journalPath: "journal/CUTOVER_JOURNAL.jsonl",
+      steps: [
+        { id: "preflight" },
+        { id: "user-site-main" },
+        { id: "source-refs" },
+        { id: "rename" },
+        { id: "close-pull-requests" },
+        { id: "metadata-and-pages" },
+        { id: "verify" },
+      ],
+    },
+    postconditions: {
+      canonicalEndpoint: "https://leonxlnx.github.io/kimi-code-desktop/",
+      legacyEndpoint: "https://leonxlnx.github.io/tasty-desktop/",
+      feedFiles: releaseAssets.map(({ id: _id, ...entry }) => entry),
+      releaseRecordAndAssetsUnchanged: true,
+      "signedV0.12PublicationIsSeparate": true,
+      desktopInstallationIsSeparate: true,
+    },
+    deferredGates: {
+      repositoryProtections: {
+        phase: "post-cutover-pre-release",
+        sourceRepositoryId: 1303365335,
+        branch: "main",
+        executorMustNotConfigureOrClaimCompletion: true,
+        separatePolicyAndVerificationRequired: true,
+        "blocksSignedV0.12Publication": true,
+        blocksDesktopInstallation: true,
+      },
+    },
+    capturedInitialState: {
+      sourceRepository: {
+        metadata: {
+          description: "Legacy fixture repository before migration.",
+          homepage: "https://leonxlnx.github.io/tasty-desktop/",
+          topics: ["legacy", "test-fixture"],
+        },
+        pages: {
+          buildType: "legacy",
+          source: { branch: "gh-pages", path: "/" },
+          cname: null,
+          httpsEnforced: true,
+          url: "https://leonxlnx.github.io/tasty-desktop/",
+        },
+      },
+      userSiteRepository: {
+        pages: {
+          buildType: "legacy",
+          source: { branch: "main", path: "/" },
+          cname: null,
+          httpsEnforced: true,
+          url: "https://leonxlnx.github.io/",
+        },
+      },
+    },
+  };
+}
 
 function fixtureManifest(overrides = {}) {
   const manifest = structuredClone(ROOT_MANIFEST);
@@ -164,6 +402,8 @@ function fakeHarness(manifest, options = {}) {
       if (spec.capability === "github.rename-repository") {
         state.sourceRepository.name = manifest.sourceRepository.approvedName;
         state.oldSlugRepositoryId = manifest.sourceRepository.repositoryId;
+        state.sourceRepository.metadata.homepage = manifest.postconditions.canonicalEndpoint;
+        state.sourceRepository.pages.url = manifest.postconditions.canonicalEndpoint;
         return response(200, {});
       }
       if (spec.capability === "github.close-pull-request") {
@@ -183,6 +423,9 @@ function fakeHarness(manifest, options = {}) {
       }
       if (spec.capability === "github.configure-pages") {
         const repository = new URL(spec.url).pathname.split("/").slice(2, 4).join("/");
+        if (repository === manifest.sourceRepository.approvedName && options.sourcePagesFailureResponse) {
+          return options.sourcePagesFailureResponse;
+        }
         if (repository === manifest.sourceRepository.approvedName) state.sourceRepository.pages = structuredClone(manifest.sourceRepository.desiredPages);
         else state.userSiteRepository.pages = structuredClone(manifest.userSiteRepository.desiredPages);
         return response(204, undefined);
@@ -504,12 +747,241 @@ test("full apply emits the exact CAS/atomic transcript and reaches pinned postco
   assert.deepEqual(pushes[1].args, [...pushCommand(buildSourcePush(manifest), manifest).args]);
   assert.equal(harness.fetches.filter((entry) => entry.capability === "github.rename-repository").length, 1);
   assert.equal(harness.fetches.filter((entry) => entry.capability === "github.close-pull-request").length, manifest.sourceRepository.pullRequestsToClose.length);
-  assert.equal(harness.fetches.filter((entry) => entry.capability === "github.configure-pages").length, 1);
+  const pagesMutations = harness.fetches.filter((entry) => entry.capability === "github.configure-pages");
+  assert.equal(pagesMutations.length, 1);
+  assert.deepEqual(pagesMutations[0].body, { build_type: "workflow" });
+  assert.equal("cname" in pagesMutations[0].body, false);
+  assert.equal("https_enforced" in pagesMutations[0].body, false);
+  assert.equal(harness.state.sourceRepository.pages.cname, null);
+  assert.equal(harness.state.sourceRepository.pages.httpsEnforced, true);
   assert.equal(harness.state.sourceRepository.repositoryId, manifest.sourceRepository.repositoryId);
   assert.deepEqual(harness.state.sourceRepository.release.assets, manifest.release.assets);
   const journal = await readFile(join(workspaceRoot, manifest.execution.journalPath), "utf8");
   assert.match(journal, /"event":"run-verified"/u);
 }));
+
+test("GitHub mutation failures report only bounded allowlisted diagnostics", async () => {
+  let arrayBufferCalls = 0;
+  let hangingReaderCancellations = 0;
+  let zeroChunkReads = 0;
+  let zeroChunkCancellations = 0;
+  const githubTokenFixture = (suffix) => ["gh", `p_${suffix}`].join("");
+  const bearerFixture = (suffix) => ["Bearer", githubTokenFixture(suffix)].join(" ");
+  const credentialMessages = [
+    ["40-character hex", "0123456789abcdef0123456789abcdef01234567"],
+    ["base64 credential", "c2VjcmV0LWNsaWVudC1jcmVkZW50aWFsLXRva2VuLWJ5dGVz"],
+    ["random credential", ["sk", "live", "F7sQ9vW2xN4mK8pR6tY3uH5jL1cB0dA"].join("_")],
+  ];
+  const emptyCategories = {
+    pages: false,
+    "not-enabled": false,
+    "not-found": false,
+    workflow: false,
+    branch: false,
+    permission: false,
+    access: false,
+    repository: false,
+    endpoint: false,
+  };
+  const redactedMetadata = (message, categories = emptyCategories) => ({
+    normalizedUtf8Bytes: Buffer.byteLength(message, "utf8"),
+    sha256: sha256(Buffer.from(message, "utf8")),
+    categories,
+  });
+  const cases = [
+    {
+      name: "safe JSON",
+      response: () => new Response(JSON.stringify({
+        message: "Not Found",
+        documentation_url: "https://docs.github.com/rest/pages/pages#update-information-about-a-github-pages-site",
+        ignored: "must-not-be-reported",
+      }), {
+        status: 404,
+        headers: {
+          "x-github-request-id": "ABCD:1234:EF56",
+          "x-oauth-scopes": "repo, workflow",
+          "x-accepted-oauth-scopes": "repo",
+        },
+      }),
+      verify(error) {
+        assert.match(error.message, /github\.configure-pages returned HTTP 404/u);
+        assert.match(error.message, /GitHub message="Not Found"/u);
+        assert.match(error.message, /documentation_url="https:\/\/docs\.github\.com\/rest\/pages\/pages#update-information-about-a-github-pages-site"/u);
+        assert.match(error.message, /X-GitHub-Request-Id="ABCD:1234:EF56"/u);
+        assert.match(error.message, /X-OAuth-Scopes="repo, workflow"/u);
+        assert.match(error.message, /X-Accepted-OAuth-Scopes="repo"/u);
+        assert.doesNotMatch(error.message, /message_metadata=/u);
+        assert.doesNotMatch(error.message, /must-not-be-reported/u);
+      },
+    },
+    {
+      name: "redacted category metadata",
+      message: "GitHub Pages is not enabled; workflow branch cannot be found for this repository because permission access failed at endpoint",
+      response() {
+        return new Response(JSON.stringify({ message: this.message }), {
+          status: 404,
+          headers: { "x-github-request-id": "CATEGORY:1" },
+        });
+      },
+      verify(error) {
+        const expected = redactedMetadata(this.message, {
+          pages: true,
+          "not-enabled": true,
+          "not-found": true,
+          workflow: true,
+          branch: true,
+          permission: true,
+          access: true,
+          repository: true,
+          endpoint: true,
+        });
+        assert.match(error.message, /GitHub message="\[redacted\]"/u);
+        assert.ok(error.message.includes(`message_metadata=${JSON.stringify(expected)}`), error.message);
+        assert.doesNotMatch(error.message, /GitHub Pages is not enabled/u);
+      },
+    },
+    {
+      name: "malformed JSON",
+      response: () => new Response("{malformed ghp_body_secret_1234567890", {
+        status: 404,
+        headers: { "x-github-request-id": "MALFORMED:1", "x-accepted-oauth-scopes": "" },
+      }),
+      verify(error) {
+        assert.match(error.message, /body=malformed/u);
+        assert.match(error.message, /X-GitHub-Request-Id="MALFORMED:1"/u);
+        assert.match(error.message, /X-Accepted-OAuth-Scopes="<empty>"/u);
+        assert.doesNotMatch(error.message, /ghp_body_secret/u);
+      },
+    },
+    {
+      name: "arrayBuffer-only adapter",
+      response: () => ({
+        status: 404,
+        body: null,
+        headers: new Headers({ "x-github-request-id": "ARRAYBUFFER:1" }),
+        async arrayBuffer() {
+          arrayBufferCalls += 1;
+          return Buffer.alloc(1_000_000, 0x61);
+        },
+      }),
+      verify(error) {
+        assert.match(error.message, /body=unavailable/u);
+        assert.match(error.message, /X-GitHub-Request-Id="ARRAYBUFFER:1"/u);
+        assert.equal(arrayBufferCalls, 0);
+      },
+    },
+    {
+      name: "hanging stream reader",
+      response: () => ({
+        status: 404,
+        headers: new Headers({ "x-github-request-id": "HANGING:1" }),
+        body: {
+          getReader() {
+            return {
+              read: () => new Promise(() => undefined),
+              cancel() {
+                hangingReaderCancellations += 1;
+                return Promise.resolve();
+              },
+            };
+          },
+        },
+      }),
+      verify(error) {
+        assert.match(error.message, /body=unavailable-timeout/u);
+        assert.equal(hangingReaderCancellations, 1);
+      },
+    },
+    {
+      name: "endless zero-length chunks",
+      response: () => ({
+        status: 404,
+        headers: new Headers({ "x-github-request-id": "ZERO:1" }),
+        body: {
+          getReader() {
+            return {
+              read() {
+                zeroChunkReads += 1;
+                return Promise.resolve({ done: false, value: new Uint8Array(0) });
+              },
+              cancel() {
+                zeroChunkCancellations += 1;
+                return Promise.resolve();
+              },
+            };
+          },
+        },
+      }),
+      verify(error) {
+        assert.match(error.message, /body=unavailable-read-limit/u);
+        assert.equal(zeroChunkReads, 64);
+        assert.equal(zeroChunkCancellations, 1);
+      },
+    },
+    {
+      name: "oversized JSON",
+      response: () => new Response(JSON.stringify({ message: `Not Found ${"x".repeat(9_000)} ghp_oversized_secret_1234567890` }), {
+        status: 404,
+        headers: { "x-github-request-id": "OVERSIZED:1" },
+      }),
+      verify(error) {
+        assert.match(error.message, /body=redacted-oversized/u);
+        assert.match(error.message, /X-GitHub-Request-Id="OVERSIZED:1"/u);
+        assert.doesNotMatch(error.message, /ghp_oversized_secret/u);
+      },
+    },
+    {
+      name: "sensitive JSON",
+      response: () => new Response(JSON.stringify({
+        message: `authorization=${bearerFixture("message_secret_1234567890")}`,
+        documentation_url: "https://docs.github.com/rest/pages#token%3Dghp_url_secret_1234567890",
+        token: "ghp_field_secret_1234567890",
+        errors: [{ secret: "ghp_nested_secret_1234567890" }],
+      }), {
+        status: 404,
+        headers: {
+          "x-github-request-id": "SENSITIVE:1",
+          "x-oauth-scopes": "repo, workflow",
+          authorization: bearerFixture("header_secret_1234567890"),
+        },
+      }),
+      verify(error) {
+        assert.match(error.message, /GitHub message="\[redacted\]"/u);
+        assert.match(error.message, /X-OAuth-Scopes="repo, workflow"/u);
+        assert.doesNotMatch(error.message, /documentation_url=/u);
+        assert.doesNotMatch(error.message, /ghp_|Bearer|token=|nested_secret|header_secret/u);
+      },
+    },
+    ...credentialMessages.map(([name, credential]) => ({
+      name,
+      response: () => new Response(JSON.stringify({ message: credential }), {
+        status: 404,
+        headers: { "x-github-request-id": "CREDENTIAL:1" },
+      }),
+      verify(error) {
+        assert.match(error.message, /GitHub message="\[redacted\]"/u);
+        assert.doesNotMatch(error.message, new RegExp(credential.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));
+        assert.ok(error.message.includes(`message_metadata=${JSON.stringify(redactedMetadata(credential))}`));
+      },
+    })),
+  ];
+
+  for (const scenario of cases) {
+    await withWorkspace(async (workspaceRoot) => {
+      const manifest = fixtureManifest();
+      const harness = fakeHarness(manifest, { sourcePagesFailureResponse: scenario.response() });
+      await assert.rejects(
+        createMigrationExecutor(harness.dependencies).run({ ...manifestInput(manifest), mode: "apply", workspaceRoot }),
+        (error) => {
+          scenario.verify(error);
+          return true;
+        },
+        scenario.name,
+      );
+      assert.equal(harness.fetches.filter((entry) => entry.capability === "github.configure-pages").length, 1);
+    });
+  }
+});
 
 test("a crash after an atomic push resumes from remote truth without replaying mutations", async () => withWorkspace(async (workspaceRoot) => {
   const manifest = fixtureManifest();
@@ -537,6 +1009,11 @@ test("a crash after an individual PR or metadata API write resumes without repla
   const manifest = fixtureManifest();
   const firstPull = manifest.sourceRepository.pullRequestsToClose[0].number;
   const cases = [
+    {
+      step: "rename",
+      capability: "github.rename-repository",
+      matches: (entry) => new URL(entry.url).pathname.endsWith(`/${manifest.sourceRepository.currentName}`),
+    },
     {
       step: `close-pull-request:${firstPull}`,
       capability: "github.close-pull-request",
@@ -630,6 +1107,60 @@ test("bounded pagination refuses to silently truncate a 2,000-item inventory", a
   };
   await assert.rejects(apiListPaginated(fetchAdapter, { manifest }, manifest.sourceRepository.currentName, "/git/matching-refs/heads/", null), /exceeded.*20-page bound/u);
   assert.equal(calls, 20);
+});
+
+test("GitHub read allowlist admits only the exact pinned numeric repository endpoint", () => {
+  const manifest = fixtureManifest();
+  const path = `/repositories/${manifest.sourceRepository.repositoryId}`;
+  const spec = {
+    capability: "github.read",
+    method: "GET",
+    url: `https://api.github.com${path}`,
+    redirect: "manual",
+    timeoutMs: 20_000,
+    headers: { accept: "application/vnd.github+json" },
+  };
+  assert.equal(assertFetchAllowed(spec, { manifest }), spec);
+
+  const rejected = [
+    { ...spec, url: `https://api.github.com/repositories/${manifest.sourceRepository.repositoryId + 1}` },
+    { ...spec, url: `${spec.url}/topics` },
+    { ...spec, url: `${spec.url}?page=1` },
+    { ...spec, url: `https://api.github.com:444${path}` },
+    { ...spec, body: {} },
+    { ...spec, capability: "github.rename-repository", method: "PATCH", body: { name: "kimi-code-desktop" } },
+  ];
+  for (const candidate of rejected) {
+    assert.throws(() => assertFetchAllowed(candidate, { manifest }), /allowlist/u);
+  }
+});
+
+test("old source slug may redirect to its exact pinned numeric repository endpoint", async () => {
+  const manifest = fixtureManifest();
+  const requests = [];
+  const numericPath = `/repositories/${manifest.sourceRepository.repositoryId}`;
+  const fetchAdapter = {
+    async request(spec) {
+      requests.push(structuredClone(spec));
+      const path = new URL(spec.url).pathname;
+      if (path === `/repos/${manifest.sourceRepository.currentName}`) {
+        return response(301, {}, { location: `https://api.github.com${numericPath}` });
+      }
+      if (path === numericPath) {
+        return response(200, { id: manifest.sourceRepository.repositoryId, full_name: manifest.sourceRepository.approvedName });
+      }
+      throw new Error(`Unexpected redirect fixture URL ${spec.url}`);
+    },
+  };
+
+  const repository = await apiGetFollowingRedirects(fetchAdapter, { manifest }, manifest.sourceRepository.currentName, "", 3);
+  assert.equal(repository.id, manifest.sourceRepository.repositoryId);
+  assert.equal(repository.full_name, manifest.sourceRepository.approvedName);
+  assert.deepEqual(requests.map((entry) => new URL(entry.url).pathname), [
+    `/repos/${manifest.sourceRepository.currentName}`,
+    numericPath,
+  ]);
+  assert.equal(requests.every((entry) => entry.capability === "github.read" && entry.method === "GET" && entry.body === undefined), true);
 });
 
 test("legacy-feed App discovery uses App JWT and installation-token scope without gh OAuth endpoints", async () => {
@@ -746,6 +1277,44 @@ test("captured GitHub Pages responses distinguish the root site URL from the leg
   const wrongManifest = fixtureManifest();
   wrongManifest.userSiteRepository.desiredPages.url = wrongManifest.postconditions.legacyEndpoint;
   assert.throws(() => validateManifest(wrongManifest), /user-site desired Pages configuration is not exact/u);
+});
+
+test("only redirect-proven rename side effects classify as incomplete metadata and Pages", () => {
+  const manifest = fixtureManifest();
+  const renamed = fullyMigrated(manifest);
+  renamed.sourceRepository.metadata = {
+    ...structuredClone(manifest.capturedInitialState.sourceRepository.metadata),
+    homepage: manifest.postconditions.canonicalEndpoint,
+  };
+  renamed.sourceRepository.pages = {
+    ...structuredClone(manifest.capturedInitialState.sourceRepository.pages),
+    url: manifest.postconditions.canonicalEndpoint,
+  };
+  const state = classifyState(manifest, renamed);
+  assert.equal(state.rename, "new");
+  assert.equal(state.redirect, true);
+  assert.equal(state.repositoryMetadata, false);
+  assert.equal(state.repositoryTopics, false);
+  assert.equal(state.sourcePages, false);
+  assert.equal(state.metadata, false);
+  assert.equal(state.complete, false);
+
+  const preRename = oldSnapshot(manifest);
+  preRename.sourceRepository.metadata = structuredClone(renamed.sourceRepository.metadata);
+  preRename.sourceRepository.pages = structuredClone(renamed.sourceRepository.pages);
+  assert.throws(() => classifyState(manifest, preRename), /source repository metadata differs/u);
+
+  const missingRedirect = structuredClone(renamed);
+  missingRedirect.oldSlugRepositoryId = null;
+  assert.throws(() => classifyState(manifest, missingRedirect), /Old source slug does not redirect/u);
+
+  const metadataDrift = structuredClone(renamed);
+  metadataDrift.sourceRepository.metadata.description = "unapproved rename side effect";
+  assert.throws(() => classifyState(manifest, metadataDrift), /source repository metadata differs/u);
+
+  const pagesDrift = structuredClone(renamed);
+  pagesDrift.sourceRepository.pages.source = { branch: "main", path: "/" };
+  assert.throws(() => classifyState(manifest, pagesDrift), /source Pages configuration differs/u);
 });
 
 test("empty or malformed journal cannot authorize an unjournaled remote prefix", async () => withWorkspace(async (workspaceRoot) => {

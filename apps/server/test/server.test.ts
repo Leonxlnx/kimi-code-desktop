@@ -1,9 +1,9 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { WebSocket, type RawData } from "ws";
@@ -13,11 +13,16 @@ import { ScheduleStore } from "../src/schedule-store.js";
 import { findGitBinary } from "../src/checkpoint-reactor.js";
 
 const exec = promisify(execFile);
+const ownedSockets = new Set<WebSocket>();
+const pendingWaiters = new Set<TestWaiter>();
+const serverStates = new WeakMap<ChildProcess, TestServerState>();
 
 describe("orchestration server", () => {
   const children: ReturnType<typeof spawn>[] = [];
 
-  afterEach(() => children.splice(0).forEach((child) => child.kill()));
+  afterEach(async () => {
+    await cleanupTestHarness(children);
+  }, 15_000);
 
   it("prefers KIMI_DESKTOP_HOME over legacy TASTY_HOME", async () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
@@ -38,26 +43,10 @@ describe("orchestration server", () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
     const port = "45117";
     const dataHome = await mkdtemp(join(tmpdir(), "kimi-server-test-"));
-    const child = spawn(process.execPath, ["--import", "tsx", serverPath], {
-      env: { ...process.env, KIMI_FAKE: "1", KIMI_SERVER_PORT: port, KIMI_DESKTOP_HOME: dataHome },
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    children.push(child);
-    await new Promise<void>((resolve, reject) => {
-      child.stdout.setEncoding("utf8");
-      child.stdout.on("data", (chunk: string) => chunk.includes("listening") && resolve());
-      child.once("error", reject);
-      child.once("exit", (code) => code && reject(new Error(`Server exited with ${code}`)));
-    });
+    await launchServer(serverPath, port, dataHome, children);
 
-    const socket = new WebSocket(`ws://127.0.0.1:${port}`, { origin: "http://127.0.0.1:1420" });
     const messages: Array<Record<string, unknown>> = [];
-    socket.on("message", (data) => messages.push(JSON.parse(data.toString()) as Record<string, unknown>));
-    await new Promise<void>((resolve, reject) => {
-      socket.once("open", resolve);
-      socket.once("error", reject);
-    });
+    const socket = await connect(port, messages);
 
     const bootstrapReply = waitFor(socket, messages, (message) => message.id === 1);
     socket.send(JSON.stringify({ id: 1, method: "env.bootstrap", params: {} }));
@@ -230,7 +219,7 @@ describe("orchestration server", () => {
     socket.close();
 
     const exited = new Promise<void>((resolveExit) => firstServer.once("exit", () => resolveExit()));
-    firstServer.kill();
+    await crashTestServer(firstServer);
     await exited;
     await launchServer(serverPath, "45312", dataHome, children);
     const restartedMessages: Array<Record<string, unknown>> = [];
@@ -344,7 +333,7 @@ describe("orchestration server", () => {
     firstSocket.send(JSON.stringify({ id: 5, method: "threads.list", params: {} }));
     const beforeRestart = (await listReply).result as { threads: unknown[] };
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
 
     await launchServer(serverPath, "45119", dataHome, children);
     const secondMessages: Array<Record<string, unknown>> = [];
@@ -388,7 +377,7 @@ describe("orchestration server", () => {
     firstSocket.send(JSON.stringify({ id: 4, method: "threads.sendTurn", params: { threadId, text: "Run this after restart" } }));
     await queued;
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
 
     await launchServer(serverPath, "45127", dataHome, children);
     const secondMessages: Array<Record<string, unknown>> = [];
@@ -776,7 +765,7 @@ describe("orchestration server", () => {
       && (event.payload as { creationId?: string }).creationId === creationId);
     const expected = { threadId: stored.threadId, sessionId: (stored.payload as { sessionId: string }).sessionId };
     const exited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
-    first.kill();
+    await crashTestServer(first);
     await exited;
 
     await launchServer(serverPath, "45321", dataHome, children);
@@ -838,7 +827,7 @@ describe("orchestration server", () => {
     expect((await hijackReply).error).toMatchObject({ message: expect.stringMatching(/reserved by an unfinished thread creation/i) });
     const exited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
     await exited;
 
     await launchServer(serverPath, "45324", dataHome, children);
@@ -867,7 +856,7 @@ describe("orchestration server", () => {
     await waitForCreationReservation(dataHome, creationId, (reservation) => reservation.stage === "requesting" && !reservation.sessionId);
     const exited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
     await exited;
     await writeFile(join(dataHome, "pending-thread-creations.json"), "{", "utf8");
 
@@ -913,7 +902,7 @@ describe("orchestration server", () => {
     await access(String(pending.targetCwd));
     const exited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
     await exited;
 
     await launchServer(serverPath, "45328", dataHome, children);
@@ -931,8 +920,10 @@ describe("orchestration server", () => {
 
   it("retains recovery ownership when an isolated worktree cannot be cleaned", async () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
-    const dataHome = await mkdtemp(join(tmpdir(), "kimi-server-create-cleanup-failure-"));
-    const workspace = await mkdtemp(join(tmpdir(), "kimi-server-create-cleanup-source-"));
+    const canonicalDataHome = await mkdtemp(join(tmpdir(), "kimi-server-create-cleanup-failure-"));
+    const dataHome = await createDirectoryAlias(canonicalDataHome, "kimi-server-create-cleanup-alias-");
+    const canonicalWorkspace = await mkdtemp(join(tmpdir(), "kimi-server-create-cleanup-source-"));
+    const workspace = await createDirectoryAlias(canonicalWorkspace, "kimi-server-create-cleanup-source-alias-");
     const git = findGitBinary();
     await exec(git, ["-C", workspace, "init"]);
     await exec(git, ["-C", workspace, "config", "user.name", "Test"]);
@@ -949,7 +940,7 @@ describe("orchestration server", () => {
     await writeFile(marker, "leave me alone", "utf8");
     const reservation = {
       creationId,
-      fingerprint: testThreadCreationFingerprint(params),
+      fingerprint: testThreadCreationFingerprint({ ...params, cwd: canonicalWorkspace }),
       threadId,
       provider: "kimi",
       standalone: false,
@@ -989,7 +980,7 @@ describe("orchestration server", () => {
     expect(rejectedJournal.reservations).toEqual([]);
     const exited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
     await exited;
 
     await launchServer(serverPath, "45331", dataHome, children);
@@ -1020,7 +1011,7 @@ describe("orchestration server", () => {
     expect((await duplicateReply).error).toMatchObject({ message: expect.stringMatching(/already used by a thread that no longer exists/i) });
     const exited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
     await exited;
 
     await launchServer(serverPath, "45333", dataHome, children);
@@ -1120,7 +1111,7 @@ describe("orchestration server", () => {
       && (event.payload as { creationId?: string }).creationId === creationId);
     const expected = { threadId: stored.threadId, sessionId: (stored.payload as { sessionId: string }).sessionId };
     const firstExited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     const second = await launchServer(serverPath, "45437", dataHome, children);
@@ -1138,7 +1129,7 @@ describe("orchestration server", () => {
     expect((await deleteReply).error).toBeUndefined();
     const secondExited = new Promise<void>((resolveExit) => second.once("exit", () => resolveExit()));
     secondSocket.close();
-    second.kill();
+    await crashTestServer(second);
     await secondExited;
 
     await launchServer(serverPath, "45438", dataHome, children);
@@ -1168,7 +1159,7 @@ describe("orchestration server", () => {
     const parent = ((await parentReply).result as { thread: { threadId: string } }).thread;
     const firstExited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     const second = await launchServer(serverPath, "45440", dataHome, children, { KIMI_FAKE_CONFIG_DELAY_MS: "5000" });
@@ -1180,7 +1171,7 @@ describe("orchestration server", () => {
     const bound = await waitForCreationReservation(dataHome, creationId, (reservation) => reservation.stage === "bound" && typeof reservation.sessionId === "string");
     const secondExited = new Promise<void>((resolveExit) => second.once("exit", () => resolveExit()));
     secondSocket.close();
-    second.kill();
+    await crashTestServer(second);
     await secondExited;
 
     await launchServer(serverPath, "45441", dataHome, children);
@@ -1214,7 +1205,7 @@ describe("orchestration server", () => {
     const parent = ((await parentReply).result as { thread: { threadId: string } }).thread;
     const firstExited = new Promise<void>((resolveExit) => first.once("exit", () => resolveExit()));
     firstSocket.close();
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     const second = await launchServer(serverPath, "45443", dataHome, children, {
@@ -1231,7 +1222,7 @@ describe("orchestration server", () => {
     expect(sessionRequests.trim().split(/\r?\n/).filter(Boolean)).toHaveLength(1);
     const secondExited = new Promise<void>((resolveExit) => second.once("exit", () => resolveExit()));
     secondSocket.close();
-    second.kill();
+    await crashTestServer(second);
     await secondExited;
 
     await launchServer(serverPath, "45444", dataHome, children, { KIMI_FAKE_NEW_SESSION_LOG: sessionLog });
@@ -1396,7 +1387,7 @@ describe("orchestration server", () => {
     await accepted;
     firstSocket.close();
     const exited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await exited;
 
     await launchServer(serverPath, "45312", dataHome, children);
@@ -1443,7 +1434,7 @@ describe("orchestration server", () => {
     await queued;
     firstSocket.close();
     const exited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await exited;
     await writeFile(join(dataHome, "pending-queues.json"), "{}");
 
@@ -1455,7 +1446,7 @@ describe("orchestration server", () => {
     expect((await retry).error).toMatchObject({ message: expect.stringMatching(/payload could not be recovered/i) });
     secondSocket.close();
     const secondExited = new Promise<void>((resolve) => second.once("exit", () => resolve()));
-    second.kill();
+    await crashTestServer(second);
     await secondExited;
     await writeFile(join(dataHome, "pending-queues.json"), JSON.stringify({
       [threadId]: [{ queuedId: submissionId, submissionId, text: params.text, mentions: [], mode: "queue", createdAt: new Date().toISOString(), origin: "user" }],
@@ -1722,14 +1713,16 @@ describe("orchestration server", () => {
 
   it("creates explicit isolated worktree chats and archives them reversibly", async () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
-    const dataHome = await mkdtemp(join(tmpdir(), "tasty-server-worktree-home-"));
+    const canonicalDataHome = await mkdtemp(join(tmpdir(), "kimi-server-worktree-home-"));
+    const dataHome = await createDirectoryAlias(canonicalDataHome, "kimi-server-worktree-alias-");
     const workspace = await mkdtemp(join(tmpdir(), "tasty-server-worktree-source-"));
-    await exec("git", ["-C", workspace, "init"]);
-    await exec("git", ["-C", workspace, "config", "user.name", "Test"]);
-    await exec("git", ["-C", workspace, "config", "user.email", "test@example.invalid"]);
+    const git = findGitBinary();
+    await exec(git, ["-C", workspace, "init"]);
+    await exec(git, ["-C", workspace, "config", "user.name", "Test"]);
+    await exec(git, ["-C", workspace, "config", "user.email", "test@example.invalid"]);
     await writeFile(join(workspace, "tracked.txt"), "base\n", "utf8");
-    await exec("git", ["-C", workspace, "add", "."]);
-    await exec("git", ["-C", workspace, "commit", "-m", "base"]);
+    await exec(git, ["-C", workspace, "add", "."]);
+    await exec(git, ["-C", workspace, "commit", "-m", "base"]);
     await launchServer(serverPath, "45214", dataHome, children);
     const messages: Array<Record<string, unknown>> = [];
     const socket = await connect("45214", messages);
@@ -1740,6 +1733,7 @@ describe("orchestration server", () => {
     expect(created.cwd).toContain(join(await realpath(dataHome), "worktrees"));
     expect(created.worktree).toMatchObject({ sourceCwd: await realpath(workspace), branch: expect.stringMatching(/^kimi\//) });
     await expect(access(join(created.cwd, "tracked.txt"))).resolves.toBeUndefined();
+    await waitForGitWorktree(git, workspace, join(dataHome, "worktrees"));
 
     const approval = waitFor(socket, messages, (message) => (message.payload as { type?: string } | undefined)?.type === "ApprovalRequested");
     socket.send(JSON.stringify({ id: 2, method: "threads.sendTurn", params: { threadId: created.threadId, text: "Keep this active" } }));
@@ -1782,12 +1776,12 @@ describe("orchestration server", () => {
     const messages: Array<Record<string, unknown>> = [];
     const socket = await connect("45216", messages);
 
-    const failedCreate = waitFor(socket, messages, (message) => message.id === 1);
     socket.send(JSON.stringify({ id: 1, method: "threads.create", params: { cwd: workspace, isolate: true } }));
-    await waitForGitWorktree(git, workspace, join(dataHome, "worktrees"));
+    await waitForBlocker(socket, messages, "gitActions");
     const blocked = waitFor(socket, messages, (message) => message.id === 2);
     socket.send(JSON.stringify({ id: 2, method: "git.stage", params: { cwd: workspace, paths: ["pending.txt"] } }));
     expect((await blocked).error).toMatchObject({ message: expect.stringMatching(/Git action/i) });
+    const failedCreate = waitFor(socket, messages, (message) => message.id === 1);
     expect((await failedCreate).error).toBeDefined();
     expect((await exec(git, ["-C", workspace, "worktree", "list", "--porcelain"])).stdout.replaceAll("\\", "/").toLowerCase())
       .not.toContain(join(dataHome, "worktrees").replaceAll("\\", "/").toLowerCase());
@@ -1893,7 +1887,7 @@ describe("orchestration server", () => {
     const threadId = ((await createdReply).result as { thread: { threadId: string } }).thread.threadId;
     firstSocket.close();
     const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     await launchServer(serverPath, "45211", dataHome, children, {
@@ -1965,7 +1959,7 @@ describe("orchestration server", () => {
     first.close();
     second.close();
     const terminalServerExited = new Promise<void>((resolve) => terminalServer.once("exit", () => resolve()));
-    terminalServer.kill();
+    await crashTestServer(terminalServer);
     await terminalServerExited;
 
     await launchServer(serverPath, "45419", dataHome, children);
@@ -2047,7 +2041,7 @@ describe("orchestration server", () => {
       const threadId = ((await created).result as { thread: { threadId: string } }).thread.threadId;
       firstSocket.close();
       const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-      first.kill();
+      await crashTestServer(first);
       await firstExited;
 
       await launchServer(serverPath, secondPort, dataHome, children, { KIMI_FAKE_INITIALIZE_DELAY_MS: "400" });
@@ -2103,7 +2097,7 @@ describe("orchestration server", () => {
     expect(firstMessages.some((message) => (message.payload as { type?: string } | undefined)?.type === "TurnCompleted")).toBe(false);
     firstSocket.close();
     const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     await launchServer(serverPath, "45142", dataHome, children, { KIMI_CODE_HOME: kimiHome });
@@ -2173,7 +2167,7 @@ describe("orchestration server", () => {
     const threadId = ((await created).result as { thread: { threadId: string } }).thread.threadId;
     firstSocket.close();
     const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     await launchServer(serverPath, "45303", dataHome, children, { KIMI_FAKE_INITIALIZE_DELAY_MS: "1500" });
@@ -2218,7 +2212,7 @@ describe("orchestration server", () => {
     const threadId = ((await created).result as { thread: { threadId: string } }).thread.threadId;
     firstSocket.close();
     const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     await launchServer(serverPath, "45305", dataHome, children, { KIMI_FAKE_INITIALIZE_DELAY_MS: "1500" });
@@ -2413,7 +2407,7 @@ describe("orchestration server", () => {
     expect(beforeRestart?.backgroundTasks[0]).not.toHaveProperty("outputPath");
     firstSocket.close();
     const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     await writeFile(join(dataHome, "pending-queues.json"), JSON.stringify({
@@ -2556,7 +2550,6 @@ describe("orchestration server", () => {
     });
     socket.send(JSON.stringify({ id: 3, method: "threads.sendTurn", params: { threadId, text: "__STALE_RUNTIME_DIAGNOSTIC__" } }));
     await completed;
-    await new Promise((resolve) => setTimeout(resolve, 50));
 
     const approved = waitFor(socket, messages, (message) => message.id === 4);
     socket.send(JSON.stringify({ id: 4, method: "mcp.approveProject", params: { cwd: workspace, fingerprint } }));
@@ -2623,8 +2616,7 @@ describe("orchestration server", () => {
       KIMI_FAKE_INITIALIZE_DELAY_MS: "5000",
       KIMI_FAKE_SHUTDOWN_AFTER_MS: "1000",
     });
-    const stderr: string[] = [];
-    child.stderr?.on("data", (chunk) => stderr.push(String(chunk)));
+    const serverExit = serverStates.get(child)!.closed;
     const messages: Array<Record<string, unknown>> = [];
     const socket = await connect("45428", messages);
     socket.send(JSON.stringify({ id: 1, method: "env.bootstrap", params: {} }));
@@ -2633,14 +2625,12 @@ describe("orchestration server", () => {
     socket.send(JSON.stringify({ id: 2, method: "diagnostics.snapshot", params: {} }));
     expect(((await snapshot).result as { blockers: { runtimeStarts: number } }).blockers.runtimeStarts).toBe(1);
 
-    const exit = new Promise<number | null>((resolveExit) => child.once("exit", (code) => resolveExit(code)));
-    const exitCode = await Promise.race([
-      exit,
+    const exit = await Promise.race([
+      serverExit,
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Server did not finish shutdown while the runtime was starting")), 4_000)),
     ]);
-    expect(exitCode).not.toBeNull();
-    if (exitCode !== 0) expect(stderr.join("")).toMatch(/terminate ACP process tree|taskkill/i);
-    expect(child.exitCode).toBe(exitCode);
+    expect(exit).toMatchObject({ code: 0, signal: null });
+    expect(child.exitCode).toBe(exit.code);
   }, 10_000);
 
   it("quiesces runtime callbacks, prompt settlement, and background mutations before the final shutdown flush", async () => {
@@ -2652,8 +2642,6 @@ describe("orchestration server", () => {
       KIMI_FAKE_BACKGROUND_REGISTRATION_DELAY_MS: "2500",
       KIMI_FAKE_SHUTDOWN_STDIN: "1",
     });
-    const stderr: string[] = [];
-    child.stderr?.on("data", (chunk) => stderr.push(String(chunk)));
     const messages: Array<Record<string, unknown>> = [];
     const socket = await connect("45429", messages);
     const created = waitFor(socket, messages, (message) => message.id === 1);
@@ -2677,8 +2665,7 @@ describe("orchestration server", () => {
       exit,
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Server did not quiesce runtime work before shutdown")), 6_000)),
     ]);
-    expect(exitCode).not.toBeNull();
-    if (exitCode !== 0) expect(stderr.join("")).toMatch(/terminate ACP process tree|taskkill/i);
+    expect(exitCode).toBe(0);
 
     const events = (await readFile(join(dataHome, "events.jsonl"), "utf8"))
       .trim().split(/\r?\n/).filter(Boolean)
@@ -2703,8 +2690,6 @@ describe("orchestration server", () => {
       KIMI_FAKE_SCHEDULE_RESULT_DELAY_MS: "500",
       KIMI_FAKE_SHUTDOWN_STDIN: "1",
     });
-    const stderr: string[] = [];
-    child.stderr?.on("data", (chunk) => stderr.push(String(chunk)));
     const messages: Array<Record<string, unknown>> = [];
     const socket = await connect("45430", messages);
     const created = waitFor(socket, messages, (message) => message.id === 1);
@@ -2717,7 +2702,7 @@ describe("orchestration server", () => {
       params: { threadId, name: "Hold shutdown drain", text: "Run after restart", recurrence: "once", nextRunAt: new Date(Date.now() + 60_000).toISOString() },
     }));
     const scheduleId = ((await scheduled).result as { schedule: { id: string } }).schedule.id;
-    const preview = new WebSocket(`ws://127.0.0.1:45430/?preview-token=${token}`);
+    const preview = ownSocket(new WebSocket(`ws://127.0.0.1:45430/?preview-token=${token}`));
     await new Promise<void>((resolveOpen, rejectOpen) => {
       preview.once("open", resolveOpen);
       preview.once("error", rejectOpen);
@@ -2733,7 +2718,7 @@ describe("orchestration server", () => {
       previewClosed,
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Preview bridge remained connected while durable work drained")), 2_200)),
     ]);
-    const reconnect = new WebSocket(`ws://127.0.0.1:45430/?preview-token=${token}`);
+    const reconnect = ownSocket(new WebSocket(`ws://127.0.0.1:45430/?preview-token=${token}`));
     const reconnectOutcome = await Promise.race([
       new Promise<"open" | "rejected">((resolveOutcome) => {
         reconnect.once("open", () => resolveOutcome("open"));
@@ -2749,8 +2734,7 @@ describe("orchestration server", () => {
       new Promise<number | null>((resolveExit) => child.once("exit", resolveExit)),
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Preview bridge kept the server alive during shutdown")), 6_000)),
     ]);
-    expect(exitCode).not.toBeNull();
-    if (exitCode !== 0) expect(stderr.join("")).toMatch(/terminate ACP process tree|taskkill/i);
+    expect(exitCode).toBe(0);
     preview.terminate();
   }, 20_000);
 
@@ -2875,8 +2859,6 @@ describe("orchestration server", () => {
       KIMI_FAKE_NEW_SESSION_DELAY_MS: "2000",
       KIMI_FAKE_SHUTDOWN_STDIN: "1",
     });
-    const stderr: string[] = [];
-    first.stderr?.on("data", (chunk) => stderr.push(String(chunk)));
     const firstMessages: Array<Record<string, unknown>> = [];
     const firstSocket = await connect("45460", firstMessages);
     firstSocket.send(JSON.stringify({ id: 1, method: "threads.create", params: { cwd: process.cwd(), creationId } }));
@@ -2887,8 +2869,7 @@ describe("orchestration server", () => {
       new Promise<number | null>((resolveExit) => first.once("exit", resolveExit)),
       new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("Shutdown did not drain the admitted thread creation")), 5_000)),
     ]);
-    expect(firstExit).not.toBeNull();
-    if (firstExit !== 0) expect(stderr.join("")).toMatch(/terminate ACP process tree|taskkill/i);
+    expect(firstExit).toBe(0);
     const journal = JSON.parse(await readFile(join(dataHome, "pending-thread-creations.json"), "utf8")) as {
       reservations: Array<{ creationId: string; stage: string; sessionId?: string }>;
     };
@@ -2911,12 +2892,11 @@ describe("orchestration server", () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
     const dataHome = await mkdtemp(join(tmpdir(), "kimi-server-onboarding-"));
     const kimiHome = await mkdtemp(join(tmpdir(), "kimi-home-onboarding-"));
-    const child = spawn(process.execPath, ["--import", "tsx", serverPath], {
-      env: { ...process.env, KIMI_SERVER_PORT: "45121", KIMI_DESKTOP_HOME: dataHome, KIMI_CODE_HOME: kimiHome, KIMI_BINARY: join(kimiHome, "missing-kimi.exe") },
-      stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+    await launchServer(serverPath, "45121", dataHome, children, {
+      KIMI_FAKE: "0",
+      KIMI_CODE_HOME: kimiHome,
+      KIMI_BINARY: join(kimiHome, "missing-kimi.exe"),
     });
-    children.push(child);
-    await waitForServer(child);
     const messages: Array<Record<string, unknown>> = [];
     const socket = await connect("45121", messages);
     const bootstrap = waitFor(socket, messages, (message) => message.id === 1);
@@ -3028,13 +3008,14 @@ describe("orchestration server", () => {
     socket.close();
   }, 20_000);
 
-  it("uses the selected Kimi home for MCP and rejects WSL project approval", async () => {
+  it("resets sibling runtimes across a workspace alias and rejects WSL project approval", async () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
     const dataHome = await mkdtemp(join(tmpdir(), "kimi-server-mcp-instances-"));
     const defaultHome = await mkdtemp(join(tmpdir(), "kimi-home-mcp-default-"));
     const namedHome = await mkdtemp(join(tmpdir(), "kimi-home-mcp-named-"));
     const siblingHome = await mkdtemp(join(tmpdir(), "kimi-home-mcp-sibling-"));
-    const workspace = await mkdtemp(join(tmpdir(), "kimi-workspace-mcp-instances-"));
+    const canonicalWorkspace = await mkdtemp(join(tmpdir(), "kimi-workspace-mcp-instances-"));
+    const workspace = await createDirectoryAlias(canonicalWorkspace, "kimi-workspace-mcp-alias-");
     const sessionLog = join(dataHome, "mcp-sessions.jsonl");
     await mkdir(join(workspace, ".git"));
     await writeFile(join(defaultHome, "mcp.json"), JSON.stringify({ mcpServers: { "default-user": { command: "default-command" } } }));
@@ -3079,7 +3060,7 @@ describe("orchestration server", () => {
     ]));
 
     const approvedReply = waitFor(socket, messages, (message) => message.id === 5);
-    socket.send(JSON.stringify({ id: 5, method: "mcp.approveProject", params: { cwd: workspace, instanceId: "named", fingerprint: named.projectMcp.fingerprint } }));
+    socket.send(JSON.stringify({ id: 5, method: "mcp.approveProject", params: { cwd: canonicalWorkspace, instanceId: "named", fingerprint: named.projectMcp.fingerprint } }));
     expect((await approvedReply).error).toBeUndefined();
     const resetReply = waitFor(socket, messages, (message) => message.id === 6);
     socket.send(JSON.stringify({ id: 6, method: "providers.list", params: {} }));
@@ -3098,11 +3079,11 @@ describe("orchestration server", () => {
       kimiCodeHome: string;
       mcpServers: string[];
     });
-    const canonicalWorkspace = await realpath(workspace);
+    const resolvedWorkspace = await realpath(workspace);
     expect(sessions).toEqual([
-      { cwd: canonicalWorkspace, kimiCodeHome: await realpath(namedHome), mcpServers: ["kimi-desktop-preview", "named-user"] },
-      { cwd: canonicalWorkspace, kimiCodeHome: await realpath(siblingHome), mcpServers: ["kimi-desktop-preview", "sibling-user"] },
-      { cwd: canonicalWorkspace, kimiCodeHome: await realpath(namedHome), mcpServers: ["kimi-desktop-preview", "named-user", "project-named"] },
+      { cwd: resolvedWorkspace, kimiCodeHome: await realpath(namedHome), mcpServers: ["kimi-desktop-preview", "named-user"] },
+      { cwd: resolvedWorkspace, kimiCodeHome: await realpath(siblingHome), mcpServers: ["kimi-desktop-preview", "sibling-user"] },
+      { cwd: resolvedWorkspace, kimiCodeHome: await realpath(namedHome), mcpServers: ["kimi-desktop-preview", "named-user", "project-named"] },
     ]);
 
     const wslReply = waitFor(socket, messages, (message) => message.id === 8);
@@ -3208,7 +3189,7 @@ describe("orchestration server", () => {
     expect(JSON.stringify(registeredEvent)).not.toContain(homeA);
     firstSocket.close();
     const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     const taskId = String((registeredEvent.payload as { payload: { taskId: string } }).payload.taskId);
@@ -3394,13 +3375,18 @@ describe("orchestration server", () => {
   it("isolates live and stale quota reads by instance and canonical Kimi home", async () => {
     const serverPath = join(dirname(fileURLToPath(import.meta.url)), "../src/server.ts");
     const dataHome = await mkdtemp(join(tmpdir(), "kimi-server-instance-quota-"));
-    const defaultHome = await mkdtemp(join(tmpdir(), "kimi-home-quota-default-"));
-    const namedHomeA = await mkdtemp(join(tmpdir(), "kimi-home-quota-named-a-"));
-    const namedHomeB = await mkdtemp(join(tmpdir(), "kimi-home-quota-named-b-"));
+    const canonicalDefaultHome = await mkdtemp(join(tmpdir(), "kimi-home-quota-default-"));
+    const canonicalNamedHomeA = await mkdtemp(join(tmpdir(), "kimi-home-quota-named-a-"));
+    const canonicalNamedHomeB = await mkdtemp(join(tmpdir(), "kimi-home-quota-named-b-"));
+    const defaultHome = await createDirectoryAlias(canonicalDefaultHome, "kimi-home-quota-default-alias-");
+    const namedHomeA = await createDirectoryAlias(canonicalNamedHomeA, "kimi-home-quota-named-a-alias-");
+    const namedHomeB = await createDirectoryAlias(canonicalNamedHomeB, "kimi-home-quota-named-b-alias-");
     const quota = (label: string) => ({ summary: { label, used: 10, limit: 100, remaining: 90 }, limits: [], updatedAt: new Date().toISOString() });
-    await writeFile(quotaCacheFile(dataHome, "kimi", defaultHome), JSON.stringify(quota("Default account")));
-    await writeFile(quotaCacheFile(dataHome, "kimi:named", namedHomeA), JSON.stringify(quota("Named account A")));
-    await writeFile(quotaCacheFile(dataHome, "kimi:named", namedHomeB), JSON.stringify(quota("Named account B")));
+    expect(quotaCacheFile(dataHome, "kimi", defaultHome)).toBe(quotaCacheFile(dataHome, "kimi", canonicalDefaultHome));
+    expect(quotaCacheFile(dataHome, "kimi:named", namedHomeA)).toBe(quotaCacheFile(dataHome, "kimi:named", canonicalNamedHomeA));
+    await writeFile(quotaCacheFile(dataHome, "kimi", canonicalDefaultHome), JSON.stringify(quota("Default account")));
+    await writeFile(quotaCacheFile(dataHome, "kimi:named", canonicalNamedHomeA), JSON.stringify(quota("Named account A")));
+    await writeFile(quotaCacheFile(dataHome, "kimi:named", canonicalNamedHomeB), JSON.stringify(quota("Named account B")));
     const configureNamed = (home: string) => writeFile(join(dataHome, "provider-instances.json"), JSON.stringify([
       { id: "named", name: "Named", provider: "kimi", environment: { KIMI_CODE_HOME: home } },
       { id: "wsl", name: "WSL", provider: "kimi", environment: {}, wsl: { distribution: "Ubuntu", binary: "/usr/bin/kimi" } },
@@ -3416,14 +3402,15 @@ describe("orchestration server", () => {
     const namedReply = waitFor(firstSocket, firstMessages, (message) => message.id === 2);
     firstSocket.send(JSON.stringify({ id: 1, method: "usage.quota", params: {} }));
     firstSocket.send(JSON.stringify({ id: 2, method: "usage.quota", params: { instanceId: "named" } }));
-    expect((await defaultReply).result).toMatchObject({ summary: { label: "Default account" }, stale: true });
-    expect((await namedReply).result).toMatchObject({ summary: { label: "Named account A" }, stale: true });
+    const [defaultResult, namedResult] = await Promise.all([defaultReply, namedReply]);
+    expect(defaultResult.result).toMatchObject({ summary: { label: "Default account" }, stale: true });
+    expect(namedResult.result).toMatchObject({ summary: { label: "Named account A" }, stale: true });
     const wslReply = waitFor(firstSocket, firstMessages, (message) => message.id === 3);
     firstSocket.send(JSON.stringify({ id: 3, method: "usage.quota", params: { instanceId: "wsl" } }));
     expect((await wslReply).error).toMatchObject({ message: expect.stringMatching(/not supported for WSL/i) });
     firstSocket.close();
     const firstExited = new Promise<void>((resolve) => first.once("exit", () => resolve()));
-    first.kill();
+    await crashTestServer(first);
     await firstExited;
 
     await configureNamed(namedHomeB);
@@ -3882,23 +3869,68 @@ describe("orchestration server", () => {
 });
 
 function quotaCacheFile(dataHome: string, key: string, home: string): string {
-  const canonicalHome = realpathSync(home).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const canonicalHome = realpathSync.native(home).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
   const identity = createHash("sha256").update(canonicalHome).digest("hex").slice(0, 16);
   return join(dataHome, `quota-cache-${key.replaceAll(":", "-")}-${identity}.json`);
 }
 
+type TestChild = ReturnType<typeof spawn>;
+
+type TestServerExit = {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  error?: Error;
+};
+
+type TestServerState = {
+  stdout: string;
+  stderr: string;
+  closed: Promise<TestServerExit>;
+  supportsGracefulShutdown: boolean;
+  spawnError?: Error;
+  exit?: TestServerExit;
+  stopMode?: "forced" | "graceful";
+};
+
+type TestWaiter = {
+  promise: Promise<Record<string, unknown>>;
+  cancel: (reason: Error) => void;
+};
+
 async function launchServer(serverPath: string, port: string, dataHome: string, children: ReturnType<typeof spawn>[], extraEnv: Record<string, string> = {}) {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    KIMI_FAKE: "1",
+    KIMI_FAKE_SHUTDOWN_STDIN: extraEnv.KIMI_FAKE_SHUTDOWN_AFTER_MS === undefined ? "1" : "0",
+    KIMI_SERVER_PORT: port,
+    KIMI_DESKTOP_HOME: dataHome,
+    ...extraEnv,
+  };
+  const supportsGracefulShutdown = env.KIMI_FAKE === "1" && env.KIMI_FAKE_SHUTDOWN_STDIN === "1";
   const child = spawn(process.execPath, ["--import", "tsx", serverPath], {
-    env: { ...process.env, KIMI_FAKE: "1", KIMI_SERVER_PORT: port, KIMI_DESKTOP_HOME: dataHome, ...extraEnv },
-    stdio: [extraEnv.KIMI_FAKE_SHUTDOWN_STDIN === "1" ? "pipe" : "ignore", "pipe", "pipe"],
+    env,
+    stdio: [supportsGracefulShutdown ? "pipe" : "ignore", "pipe", "pipe"],
     windowsHide: true,
   });
   children.push(child);
-  await waitForServer(child);
+  const state = registerTestServer(child, supportsGracefulShutdown, env.KIMI_FAKE_SHUTDOWN_AFTER_MS !== undefined);
+  try {
+    await waitForServer(child);
+  } catch (error) {
+    state.stopMode = "forced";
+    try {
+      await stopTestServer(child, false);
+    } catch (cleanupError) {
+      throw new AggregateError([asError(error), asError(cleanupError)], "Server startup and cleanup both failed");
+    }
+    throw error;
+  }
   return child;
 }
 
 async function triggerFakeShutdown(child: ReturnType<typeof spawn>): Promise<void> {
+  const state = serverStates.get(child);
+  if (state) state.stopMode = "graceful";
   const stdin = child.stdin;
   if (!stdin) throw new Error("Server stdin is unavailable for deterministic shutdown");
   stdin.end("shutdown\n");
@@ -3907,7 +3939,7 @@ async function triggerFakeShutdown(child: ReturnType<typeof spawn>): Promise<voi
 async function waitForBlocker(
   socket: WebSocket,
   messages: Array<Record<string, unknown>>,
-  blocker: "queueInsertions" | "queueStarts",
+  blocker: "gitActions" | "queueInsertions" | "queueStarts",
 ): Promise<void> {
   const deadline = Date.now() + 5_000;
   let requestId = 90_000;
@@ -3923,21 +3955,42 @@ async function waitForBlocker(
 }
 
 async function waitForServer(child: ReturnType<typeof spawn>) {
-  await new Promise<void>((resolve, reject) => {
+  const state = serverStates.get(child);
+  if (!state) throw new Error("Server process is not owned by the test harness");
+  await new Promise<void>((resolveReady, rejectReady) => {
     const stdout = child.stdout;
     if (!stdout) {
-      reject(new Error("Server stdout is unavailable"));
+      rejectReady(new Error("Server stdout is unavailable"));
       return;
     }
-    stdout.setEncoding("utf8");
-    stdout.on("data", (chunk: string) => chunk.includes("listening") && resolve());
-    child.once("error", reject);
-    child.once("exit", (code) => code && reject(new Error(`Server exited with ${code}`)));
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      stdout.off("data", onStdout);
+      if (error) rejectReady(error);
+      else resolveReady();
+    };
+    const onStdout = (chunk: string | Buffer) => {
+      if (String(chunk).includes("listening")) finish();
+    };
+    const onClosed = (result: TestServerExit) => finish(serverFailure(
+      state,
+      result.error
+        ? `Server failed before listening: ${result.error.message}`
+        : `Server exited before listening (code=${String(result.code)}, signal=${String(result.signal)})`,
+    ));
+    const timeout = setTimeout(() => finish(serverFailure(state, "Timed out waiting for server to listen")), 10_000);
+    stdout.on("data", onStdout);
+    void state.closed.then(onClosed);
+    if (state.exit) onClosed(state.exit);
+    else if (state.stdout.includes("listening")) finish();
   });
 }
 
 async function connect(port: string, messages: Array<Record<string, unknown>>): Promise<WebSocket> {
-  const socket = new WebSocket(`ws://127.0.0.1:${port}`, { origin: "http://127.0.0.1:1420" });
+  const socket = ownSocket(new WebSocket(`ws://127.0.0.1:${port}`, { origin: "http://127.0.0.1:1420" }));
   socket.on("message", (data) => messages.push(JSON.parse(data.toString()) as Record<string, unknown>));
   await new Promise<void>((resolve, reject) => {
     socket.once("open", resolve);
@@ -3949,28 +4002,251 @@ async function connect(port: string, messages: Array<Record<string, unknown>>): 
 function waitFor(socket: WebSocket, messages: Array<Record<string, unknown>>, predicate: (message: Record<string, unknown>) => boolean): Promise<Record<string, unknown>> {
   const existing = messages.find(predicate);
   if (existing) return Promise.resolve(existing);
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
+  let cancel: (reason: Error) => void = () => undefined;
+  const waiter = {} as TestWaiter;
+  const promise = new Promise<Record<string, unknown>>((resolveWait, rejectWait) => {
+    let settled = false;
+    const finish = (error?: Error, message?: Record<string, unknown>) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
       socket.off("message", onMessage);
-      reject(new Error(`Timed out waiting for WebSocket message; recent=${JSON.stringify(messages.slice(-5))}`));
+      if (error) rejectWait(error);
+      else resolveWait(message!);
+    };
+    const timeout = setTimeout(() => {
+      finish(new Error(`Timed out waiting for WebSocket message; recent=${JSON.stringify(messages.slice(-5))}`));
     }, 10_000);
     const onMessage = (data: RawData) => {
       const message = JSON.parse(data.toString()) as Record<string, unknown>;
       if (!predicate(message)) return;
-      clearTimeout(timeout);
-      socket.off("message", onMessage);
-      resolve(message);
+      finish(undefined, message);
     };
+    cancel = (reason) => finish(reason);
     socket.on("message", onMessage);
+  });
+  waiter.promise = promise;
+  waiter.cancel = (reason) => cancel(reason);
+  pendingWaiters.add(waiter);
+  void promise.then(
+    () => pendingWaiters.delete(waiter),
+    () => pendingWaiters.delete(waiter),
+  );
+  return promise;
+}
+
+function ownSocket(socket: WebSocket): WebSocket {
+  ownedSockets.add(socket);
+  socket.once("close", () => ownedSockets.delete(socket));
+  return socket;
+}
+
+function registerTestServer(child: TestChild, supportsGracefulShutdown: boolean, scheduledStop = false): TestServerState {
+  let resolveClosed!: (result: TestServerExit) => void;
+  let closed = false;
+  const state: TestServerState = {
+    stdout: "",
+    stderr: "",
+    closed: new Promise<TestServerExit>((resolveExit) => {
+      resolveClosed = resolveExit;
+    }),
+    supportsGracefulShutdown,
+  };
+  if (scheduledStop) state.stopMode = "graceful";
+  const finish = (result: TestServerExit) => {
+    if (closed) return;
+    closed = true;
+    state.exit = result;
+    resolveClosed(result);
+  };
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk: string | Buffer) => {
+    state.stdout = appendBounded(state.stdout, String(chunk));
+  });
+  child.stderr?.on("data", (chunk: string | Buffer) => {
+    state.stderr = appendBounded(state.stderr, String(chunk));
+  });
+  child.once("error", (error) => {
+    state.spawnError = error;
+    if (!child.pid) finish({ code: child.exitCode, signal: child.signalCode, error });
+  });
+  child.once("close", (code, signal) => finish(state.spawnError ? { code, signal, error: state.spawnError } : { code, signal }));
+  serverStates.set(child, state);
+  return state;
+}
+
+function appendBounded(current: string, chunk: string): string {
+  const next = current + chunk;
+  return next.length <= 16_384 ? next : next.slice(-16_384);
+}
+
+function serverFailure(state: TestServerState, message: string): Error {
+  const stderr = state.stderr.trim();
+  return new Error(stderr ? `${message}\nServer stderr (last 16 KiB):\n${stderr}` : `${message}\nServer stderr was empty`);
+}
+
+async function cleanupTestHarness(children: TestChild[]): Promise<void> {
+  const failures: Error[] = [];
+  const waiters = [...pendingWaiters];
+  const cancellation = new Error("Test completed before its WebSocket waiter settled");
+  for (const waiter of waiters) waiter.cancel(cancellation);
+  await Promise.allSettled(waiters.map((waiter) => waiter.promise));
+  if (waiters.length > 0) {
+    failures.push(new Error(`Test completed with ${waiters.length} pending WebSocket waiter(s)`));
+  }
+
+  const sockets = [...ownedSockets];
+  const socketResults = await Promise.allSettled(sockets.map(closeOwnedSocket));
+  for (const result of socketResults) {
+    if (result.status === "rejected") failures.push(asError(result.reason));
+  }
+
+  const servers = children.splice(0);
+  const serverResults = await Promise.allSettled(servers.map((child) => stopTestServer(child, true)));
+  for (const result of serverResults) {
+    if (result.status === "rejected") failures.push(asError(result.reason));
+  }
+  if (failures.length > 0) {
+    throw new AggregateError(failures, `Test harness cleanup failed (${failures.length})`);
+  }
+}
+
+async function closeOwnedSocket(socket: WebSocket): Promise<void> {
+  ownedSockets.delete(socket);
+  if (socket.readyState === WebSocket.CLOSED) return;
+  const closed = new Promise<void>((resolveClosed) => {
+    socket.once("close", () => resolveClosed());
+    socket.once("error", () => resolveClosed());
+  });
+  try {
+    if (socket.readyState === WebSocket.OPEN) socket.close();
+    else socket.terminate();
+  } catch {
+    socket.terminate();
+  }
+  if (await waitBounded(closed, 500)) return;
+  socket.terminate();
+  if (!await waitBounded(closed, 500)) throw new Error("Owned WebSocket did not close during teardown");
+}
+
+async function crashTestServer(child: TestChild): Promise<void> {
+  await stopTestServer(child, false);
+}
+
+async function stopTestServer(child: TestChild, graceful: boolean): Promise<void> {
+  const state = serverStates.get(child);
+  if (!state) throw new Error(`Cannot stop unregistered server process ${String(child.pid)}`);
+  const stoppedBeforeTeardown = state.exit !== undefined || child.exitCode !== null || child.signalCode !== null;
+  const unexpectedPreStop = stoppedBeforeTeardown && state.stopMode === undefined;
+  let treeFailure: Error | undefined;
+  let forced = false;
+  const forceTree = async () => {
+    forced = true;
+    state.stopMode = "forced";
+    try {
+      await terminateOwnedProcessTree(child);
+    } catch (error) {
+      treeFailure = asError(error);
+    }
+  };
+
+  if (!stoppedBeforeTeardown) {
+    if (graceful && state.supportsGracefulShutdown && child.stdin?.writable) {
+      state.stopMode ??= "graceful";
+      child.stdin.end("shutdown\n");
+      if (!await waitBounded(state.closed, 2_000)) await forceTree();
+    } else {
+      await forceTree();
+    }
+  }
+  let result = await waitBoundedResult(state.closed, 2_000);
+  if (!result && !forced && child.exitCode === null && child.signalCode === null) {
+    await forceTree();
+    result = await waitBoundedResult(state.closed, 2_000);
+  }
+  if (!result) throw serverFailure(state, `Owned server process ${String(child.pid)} did not exit`);
+  if (unexpectedPreStop) {
+    throw serverFailure(
+      state,
+      `Owned server process ${String(child.pid)} exited before teardown (code=${String(result.code)}, signal=${String(result.signal)})`,
+    );
+  }
+  if (treeFailure) {
+    throw serverFailure(state, `Could not prove termination of owned process tree ${String(child.pid)}: ${treeFailure.message}`);
+  }
+  if (state.stopMode === "graceful" && (result.error || result.code !== 0 || result.signal !== null)) {
+    throw serverFailure(
+      state,
+      `Graceful server shutdown failed (code=${String(result.code)}, signal=${String(result.signal)})${result.error ? `: ${result.error.message}` : ""}`,
+    );
+  }
+}
+
+async function terminateOwnedProcessTree(child: TestChild): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error("Server root exited before its descendant tree could be terminated");
+  }
+  const pid = child.pid;
+  if (!pid) throw new Error("Owned server process has no PID");
+  if (process.platform === "win32") {
+    const taskkill = join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe");
+    try {
+      await exec(taskkill, ["/PID", String(pid), "/T", "/F"], { windowsHide: true, timeout: 3_000 });
+    } catch (error) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      throw new Error(`Windows tree termination failed: ${asError(error).message}`);
+    }
+    return;
+  }
+  child.kill("SIGKILL");
+}
+
+async function waitBounded(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  return await new Promise<boolean>((resolveWait, rejectWait) => {
+    const timeout = setTimeout(() => resolveWait(false), timeoutMs);
+    promise.then(
+      () => {
+        clearTimeout(timeout);
+        resolveWait(true);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        rejectWait(error);
+      },
+    );
   });
 }
 
+async function waitBoundedResult<T>(promise: Promise<T>, timeoutMs: number): Promise<T | undefined> {
+  return await new Promise<T | undefined>((resolveWait, rejectWait) => {
+    const timeout = setTimeout(() => resolveWait(undefined), timeoutMs);
+    promise.then(
+      (result) => {
+        clearTimeout(timeout);
+        resolveWait(result);
+      },
+      (error) => {
+        clearTimeout(timeout);
+        rejectWait(error);
+      },
+    );
+  });
+}
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
+}
+
 async function waitForGitWorktree(git: string, workspace: string, storageRoot: string): Promise<void> {
-  const expected = storageRoot.replaceAll("\\", "/").toLowerCase();
+  const expected = comparableTestPath(storageRoot);
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
-    const listed = (await exec(git, ["-C", workspace, "worktree", "list", "--porcelain"])).stdout.replaceAll("\\", "/").toLowerCase();
-    if (listed.includes(expected)) return;
+    const listed = (await exec(git, ["-C", workspace, "worktree", "list", "--porcelain"])).stdout;
+    const worktrees = listed.split(/\r?\n/)
+      .filter((line) => line.startsWith("worktree "))
+      .map((line) => comparableTestPath(line.slice("worktree ".length)));
+    if (worktrees.some((worktree) => worktree.startsWith(`${expected}/`))) return;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`Timed out waiting for worktree under ${storageRoot}`);
@@ -4039,7 +4315,7 @@ function testThreadCreationFingerprint(params: { cwd?: string; standalone: boole
   add(params.instanceId ?? "");
   add(params.standalone ? "standalone" : "project");
   add(params.isolate ? "isolated" : "shared");
-  add(params.standalone ? "" : resolve(params.cwd!).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase());
+  add(params.standalone ? "" : comparableTestPath(params.cwd!));
   const config = Object.entries(params.config ?? {}).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
   add(String(config.length));
   for (const [key, value] of config) {
@@ -4048,6 +4324,35 @@ function testThreadCreationFingerprint(params: { cwd?: string; standalone: boole
     add(String(value));
   }
   return hash.digest("hex");
+}
+
+function comparableTestPath(value: string): string {
+  const requested = resolve(value);
+  let current = requested;
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      current = realpathSync.native(current);
+      break;
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) {
+        current = requested;
+        suffix.length = 0;
+        break;
+      }
+      suffix.unshift(basename(current));
+      current = parent;
+    }
+  }
+  return resolve(current, ...suffix).replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+}
+
+async function createDirectoryAlias(target: string, prefix: string): Promise<string> {
+  const aliasRoot = await mkdtemp(join(tmpdir(), prefix));
+  const alias = join(aliasRoot, "alias");
+  await symlink(target, alias, process.platform === "win32" ? "junction" : "dir");
+  return alias;
 }
 
 function testSideThreadCreationFingerprint(params: { threadId: string; title?: string }): string {

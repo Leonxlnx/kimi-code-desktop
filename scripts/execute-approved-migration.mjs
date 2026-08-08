@@ -41,6 +41,30 @@ const STEP_ORDER = Object.freeze([
   "verify",
 ]);
 const ACTIVE_WORKFLOW_STATUSES = Object.freeze(["queued", "in_progress", "waiting", "pending", "requested", "action_required"]);
+const GITHUB_ERROR_BODY_LIMIT = 8_192;
+const GITHUB_ERROR_READ_TIMEOUT_MS = 500;
+const GITHUB_ERROR_READ_LIMIT = 64;
+const GITHUB_ERROR_DOCUMENTATION_URL_LIMIT = 2_048;
+const GITHUB_ERROR_HEADER_LIMIT = 512;
+const GITHUB_ERROR_SECRET = /(?:gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,}|bearer\s+\S+|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:authorization|token|secret|password|private[_ -]?key)\s*[:=]\s*\S+|[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})/iu;
+const GITHUB_SAFE_ERROR_MESSAGES = new Set([
+  "Bad credentials",
+  "Conflict",
+  "Not Found",
+  "Resource not accessible by integration",
+  "Validation Failed",
+]);
+const GITHUB_ERROR_CATEGORY_PATTERNS = Object.freeze([
+  ["pages", /\b(?:github\s+)?pages\b/iu],
+  ["not-enabled", /\b(?:not\s+enabled|isn't\s+enabled|is\s+not\s+enabled|disabled)\b/iu],
+  ["not-found", /\b(?:not\s+found|does\s+not\s+exist|cannot\s+be\s+found)\b/iu],
+  ["workflow", /\b(?:workflows?|github\s+actions)\b/iu],
+  ["branch", /\bbranch(?:es)?\b/iu],
+  ["permission", /\bpermissions?\b/iu],
+  ["access", /\b(?:access|accessible|inaccessible)\b/iu],
+  ["repository", /\brepositor(?:y|ies)\b/iu],
+  ["endpoint", /\bendpoints?\b/iu],
+]);
 const ALLOWED_LOCAL_GIT = new Set(["cat-file", "config", "fsck", "remote", "rev-list", "rev-parse", "show"]);
 const ALLOWED_LOCAL_CONFIG = new Set([
   "core.bare",
@@ -271,13 +295,13 @@ export function classifyState(manifest, snapshot) {
     throw new Error("Pull requests changed before the atomic source-ref transition");
   }
 
-  const metadataComponents = classifyMetadataComponents(manifest, snapshot);
-  const metadata = Object.values(metadataComponents).every(Boolean);
-  const pageBytes = pagesBytesMatch(manifest, snapshot.pages);
   const redirect = renameState === "new"
     ? snapshot.oldSlugRepositoryId === manifest.sourceRepository.repositoryId
     : snapshot.oldSlugRepositoryId === null || snapshot.oldSlugRepositoryId === manifest.sourceRepository.repositoryId;
   if (renameState === "new" && !redirect) throw new Error("Old source slug does not redirect to the pinned repository ID");
+  const metadataComponents = classifyMetadataComponents(manifest, snapshot, { renameState, redirect });
+  const metadata = Object.values(metadataComponents).every(Boolean);
+  const pageBytes = pagesBytesMatch(manifest, snapshot.pages);
   const complete = userState === "new"
     && sourceState === "new"
     && renameState === "new"
@@ -890,8 +914,6 @@ async function executeStep(step, context, dependencies, command, fetchAdapter) {
       const source = manifest.sourceRepository;
       await apiMutation(fetchAdapter, context, "github.configure-pages", source.approvedName, "PUT", "/pages", {
         build_type: "workflow",
-        cname: null,
-        https_enforced: true,
       });
       return;
     }
@@ -1225,6 +1247,13 @@ export function assertFetchAllowed(spec, context) {
   const sourceOld = manifest.sourceRepository.currentName;
   const sourceNew = manifest.sourceRepository.approvedName;
   const userSite = manifest.userSiteRepository.name;
+  const pinnedSourceIdPath = `/repositories/${manifest.sourceRepository.repositoryId}`;
+  if (url.pathname === pinnedSourceIdPath) {
+    if (spec.capability !== "github.read" || spec.method !== "GET" || spec.body !== undefined || url.search || url.username || url.password || url.hash) {
+      throw new Error("GitHub numeric repository read is outside the pinned allowlist");
+    }
+    return spec;
+  }
   const encodedPath = decodeURIComponent(url.pathname);
   const repositoryPrefix = [sourceOld, sourceNew, userSite]
     .map((name) => `/repos/${name}`)
@@ -1262,7 +1291,7 @@ export function assertFetchAllowed(spec, context) {
     assertExactMutation(spec, "PUT", sourceNew, "/topics", { names: desired.topics });
   } else if (spec.capability === "github.configure-pages") {
     const expected = repository === sourceNew
-      ? { build_type: "workflow", cname: null, https_enforced: true }
+      ? { build_type: "workflow" }
       : repository === userSite
         ? { build_type: "legacy", source: manifest.userSiteRepository.desiredPages.source, cname: null, https_enforced: true }
         : null;
@@ -1600,9 +1629,160 @@ async function apiMutation(fetchAdapter, context, capability, repository, method
     headers: { accept: "application/vnd.github+json", "content-type": "application/json" },
   }, context);
   const status = responseStatus(response);
-  if (status < 200 || status >= 300) throw new Error(`${capability} returned HTTP ${status}`);
+  if (status < 200 || status >= 300) {
+    const diagnostic = await githubMutationFailureDiagnostic(response);
+    throw new Error(`${capability} returned HTTP ${status}${diagnostic}`);
+  }
   if (status === 204 || status === 205) return null;
   return responseJson(response);
+}
+
+async function githubMutationFailureDiagnostic(response) {
+  const details = [];
+  const payload = await readBoundedGithubErrorPayload(response);
+  if (payload.kind === "json") {
+    const message = sanitizeGithubErrorMessage(payload.value.message);
+    const safeDocumentationUrl = sanitizeGithubDocumentationUrl(payload.value.documentation_url);
+    if (message !== null) {
+      details.push(`GitHub message=${JSON.stringify(message.value)}`);
+      if (message.metadata !== null) details.push(`message_metadata=${JSON.stringify(message.metadata)}`);
+    }
+    if (safeDocumentationUrl !== null) details.push(`documentation_url=${JSON.stringify(safeDocumentationUrl)}`);
+    if (message === null && safeDocumentationUrl === null) details.push("body=redacted");
+  } else {
+    details.push(`body=${payload.kind}`);
+  }
+
+  for (const [name, kind] of [
+    ["X-GitHub-Request-Id", "request-id"],
+    ["X-OAuth-Scopes", "scopes"],
+    ["X-Accepted-OAuth-Scopes", "scopes"],
+  ]) {
+    const value = sanitizeGithubErrorHeader(responseHeader(response, name), kind);
+    if (value !== null) details.push(`${name}=${JSON.stringify(value)}`);
+  }
+  return details.length === 0 ? "" : ` (${details.join("; ")})`;
+}
+
+async function readBoundedGithubErrorPayload(response) {
+  const declaredLength = Number(responseHeader(response, "content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > GITHUB_ERROR_BODY_LIMIT) {
+    cancelResponseBody(response?.body);
+    return { kind: "redacted-oversized" };
+  }
+
+  if (!response?.body || typeof response.body.getReader !== "function") return { kind: "unavailable" };
+  let reader;
+  try { reader = response.body.getReader(); } catch { return { kind: "unavailable" }; }
+  const chunks = [];
+  const deadline = Date.now() + GITHUB_ERROR_READ_TIMEOUT_MS;
+  let length = 0;
+  for (let readCount = 0; readCount < GITHUB_ERROR_READ_LIMIT; readCount += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      cancelResponseBody(reader);
+      return { kind: "unavailable-timeout" };
+    }
+    const outcome = await readGithubErrorChunk(reader, remaining);
+    if (outcome.kind === "timeout") {
+      cancelResponseBody(reader);
+      return { kind: "unavailable-timeout" };
+    }
+    if (outcome.kind === "error") {
+      cancelResponseBody(reader);
+      return { kind: "unavailable" };
+    }
+    if (!outcome.result || typeof outcome.result !== "object" || typeof outcome.result.done !== "boolean") {
+      cancelResponseBody(reader);
+      return { kind: "unavailable" };
+    }
+    const { done, value } = outcome.result;
+    if (done) {
+      const bytes = Buffer.concat(chunks, length);
+      return parseGithubErrorPayload(bytes);
+    }
+    if (!(value instanceof Uint8Array) || length + value.byteLength > GITHUB_ERROR_BODY_LIMIT) {
+      cancelResponseBody(reader);
+      return { kind: "redacted-oversized" };
+    }
+    chunks.push(Buffer.from(value));
+    length += value.byteLength;
+  }
+  cancelResponseBody(reader);
+  return { kind: "unavailable-read-limit" };
+}
+
+function parseGithubErrorPayload(bytes) {
+  if (bytes.length === 0) return { kind: "empty" };
+  try {
+    const value = JSON.parse(bytes.toString("utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return { kind: "redacted" };
+    return { kind: "json", value };
+  } catch {
+    return { kind: "malformed" };
+  }
+}
+
+async function readGithubErrorChunk(reader, timeoutMs) {
+  let timeout;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => reader.read()).then(
+        (result) => ({ kind: "read", result }),
+        () => ({ kind: "error" }),
+      ),
+      new Promise((resolvePromise) => {
+        timeout = setTimeout(() => resolvePromise({ kind: "timeout" }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
+
+function cancelResponseBody(target) {
+  try {
+    const cancellation = target?.cancel?.();
+    cancellation?.catch?.(() => undefined);
+  } catch {
+    // Diagnostics must never replace the original GitHub mutation failure.
+  }
+}
+
+function sanitizeGithubErrorMessage(value) {
+  if (typeof value !== "string") return null;
+  const normalized = value.replace(/[\u0000-\u001f\u007f]+/gu, " ").trim();
+  if (!normalized) return null;
+  if (GITHUB_SAFE_ERROR_MESSAGES.has(normalized)) return { value: normalized, metadata: null };
+  return {
+    value: "[redacted]",
+    metadata: {
+      normalizedUtf8Bytes: Buffer.byteLength(normalized, "utf8"),
+      sha256: sha256(Buffer.from(normalized, "utf8")),
+      categories: Object.fromEntries(GITHUB_ERROR_CATEGORY_PATTERNS.map(([name, pattern]) => [name, pattern.test(normalized)])),
+    },
+  };
+}
+
+function sanitizeGithubDocumentationUrl(value) {
+  if (typeof value !== "string" || value.length > GITHUB_ERROR_DOCUMENTATION_URL_LIMIT || /[\u0000-\u001f\u007f]/u.test(value)) return null;
+  let decoded;
+  try { decoded = decodeURIComponent(value); } catch { return null; }
+  if (GITHUB_ERROR_SECRET.test(decoded)) return null;
+  let url;
+  try { url = new URL(value); } catch { return null; }
+  if (url.protocol !== "https:" || url.hostname !== "docs.github.com" || url.username || url.password || url.search
+    || (url.hash && !/^#[A-Za-z0-9._~-]+$/u.test(url.hash))) return null;
+  return url.href;
+}
+
+function sanitizeGithubErrorHeader(value, kind) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).trim();
+  if (kind === "scopes" && normalized === "") return "<empty>";
+  if (!normalized || normalized.length > GITHUB_ERROR_HEADER_LIMIT || GITHUB_ERROR_SECRET.test(normalized)) return null;
+  const pattern = kind === "request-id" ? /^[A-Za-z0-9:-]+$/u : /^[A-Za-z0-9:_., -]+$/u;
+  return pattern.test(normalized) ? normalized : null;
 }
 
 async function apiGet(fetchAdapter, context, repository, suffix) {
@@ -1646,7 +1826,7 @@ async function apiGetOptional(fetchAdapter, context, repository, suffix, options
   return responseJson(response);
 }
 
-async function apiGetFollowingRedirects(fetchAdapter, context, repository, suffix, maximumRedirects) {
+export async function apiGetFollowingRedirects(fetchAdapter, context, repository, suffix, maximumRedirects) {
   let url = new URL(`https://api.github.com/repos/${repository}${suffix}`);
   for (let count = 0; count <= maximumRedirects; count += 1) {
     const response = await runAllowedFetch(fetchAdapter, {
@@ -1828,16 +2008,24 @@ function assertOpenPullRequestInventory(openInventory, pinnedPulls, manifestPull
   }
 }
 
-function classifyMetadataComponents(manifest, snapshot) {
+function classifyMetadataComponents(manifest, snapshot, renameProof) {
   const source = snapshot.sourceRepository;
   const desired = manifest.sourceRepository.desiredMetadata;
   const captured = manifest.capturedInitialState;
+  const renameIntermediateAllowed = renameProof.renameState === "new" && renameProof.redirect === true;
+  const renamedMetadata = renameIntermediateAllowed
+    ? { ...metadataIdentity(captured.sourceRepository.metadata), homepage: manifest.postconditions.canonicalEndpoint }
+    : null;
+  const renamedSourcePages = renameIntermediateAllowed
+    ? { ...captured.sourceRepository.pages, url: manifest.postconditions.canonicalEndpoint }
+    : null;
   return Object.freeze({
     repositoryMetadata: exactComponentPhase(
       metadataIdentity(source.metadata),
       metadataIdentity(captured.sourceRepository.metadata),
       metadataIdentity(desired),
       "source repository metadata",
+      renamedMetadata === null ? [] : [renamedMetadata],
     ),
     repositoryTopics: exactComponentPhase(
       normalizedTopics(source.metadata?.topics),
@@ -1845,7 +2033,13 @@ function classifyMetadataComponents(manifest, snapshot) {
       normalizedTopics(desired.topics),
       "source repository topics",
     ),
-    sourcePages: exactPagesComponentPhase(source.pages, captured.sourceRepository.pages, manifest.sourceRepository.desiredPages, "source Pages configuration"),
+    sourcePages: exactPagesComponentPhase(
+      source.pages,
+      captured.sourceRepository.pages,
+      manifest.sourceRepository.desiredPages,
+      "source Pages configuration",
+      renamedSourcePages === null ? [] : [renamedSourcePages],
+    ),
     userSitePages: exactPagesComponentPhase(snapshot.userSiteRepository.pages, captured.userSiteRepository.pages, manifest.userSiteRepository.desiredPages, "user-site Pages configuration"),
   });
 }
@@ -1857,15 +2051,15 @@ function pagesConfigMatches(actual, desired) {
   return desired.source === undefined || canonicalJson(actual.source) === canonicalJson(desired.source);
 }
 
-function exactPagesComponentPhase(actual, captured, desired, label) {
-  const oldMatch = pagesConfigMatches(actual, captured);
+function exactPagesComponentPhase(actual, captured, desired, label, allowedIntermediates = []) {
+  const oldMatch = [captured, ...allowedIntermediates].some((candidate) => pagesConfigMatches(actual, candidate));
   const newMatch = pagesConfigMatches(actual, desired);
   if (!oldMatch && !newMatch) throw new Error(`${label} differs from both captured-old and approved-new state`);
   return newMatch;
 }
 
-function exactComponentPhase(actual, captured, desired, label) {
-  const oldMatch = canonicalJson(actual) === canonicalJson(captured);
+function exactComponentPhase(actual, captured, desired, label, allowedIntermediates = []) {
+  const oldMatch = [captured, ...allowedIntermediates].some((candidate) => canonicalJson(actual) === canonicalJson(candidate));
   const newMatch = canonicalJson(actual) === canonicalJson(desired);
   if (!oldMatch && !newMatch) throw new Error(`${label} differs from both captured-old and approved-new state`);
   return newMatch;
@@ -2078,7 +2272,7 @@ function assertFetchShape(spec) {
   assertPlainObject(spec, "fetch specification");
   if (!new Set(["GET", "PATCH", "POST", "PUT"]).has(spec.method)) throw new Error("Fetch method is not allowlisted");
   const url = new URL(spec.url);
-  if (url.protocol !== "https:" || !["api.github.com", "leonxlnx.github.io"].includes(url.hostname)) throw new Error("Fetch URL is not allowlisted");
+  if (url.protocol !== "https:" || url.port !== "" || !["api.github.com", "leonxlnx.github.io"].includes(url.hostname)) throw new Error("Fetch URL is not allowlisted");
   if (spec.redirect !== "manual") throw new Error("Every migration fetch must use manual redirect handling");
   if (!Number.isInteger(spec.timeoutMs) || spec.timeoutMs < 1 || spec.timeoutMs > 30_000) throw new Error("Fetch timeout is not bounded");
   const allowedCapabilities = new Set([
