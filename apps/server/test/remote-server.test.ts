@@ -193,10 +193,10 @@ describe("remote server", () => {
     const localOrphanList = await request(local, { id: 440, method: "threads.list", params: {} }) as {
       runtimeSessions: Array<{ sessionId: string; cwd?: string; kind?: string }>;
     };
-    expect(localOrphanList.runtimeSessions.find((session) => session.sessionId === standalone.thread.sessionId)).toMatchObject({
-      cwd: join(dataHome, "runtime", "chats"),
-      kind: "chat",
-    });
+    const localOrphan = localOrphanList.runtimeSessions.find((session) => session.sessionId === standalone.thread.sessionId);
+    expect(localOrphan).toMatchObject({ kind: "chat" });
+    if (!localOrphan?.cwd) throw new Error("Local orphan session is missing its runtime path");
+    expect(realpathSync.native(localOrphan.cwd)).toBe(realpathSync.native(join(dataHome, "runtime", "chats")));
     const orphanList = await request(remote, { id: 45, method: "threads.list", params: {} }) as {
       runtimeSessions: Array<{ sessionId: string; cwd?: string }>;
     };

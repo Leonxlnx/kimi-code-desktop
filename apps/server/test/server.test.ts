@@ -3080,10 +3080,14 @@ describe("orchestration server", () => {
       mcpServers: string[];
     });
     const resolvedWorkspace = await realpath(workspace);
-    expect(sessions).toEqual([
-      { cwd: resolvedWorkspace, kimiCodeHome: await realpath(namedHome), mcpServers: ["kimi-desktop-preview", "named-user"] },
-      { cwd: resolvedWorkspace, kimiCodeHome: await realpath(siblingHome), mcpServers: ["kimi-desktop-preview", "sibling-user"] },
-      { cwd: resolvedWorkspace, kimiCodeHome: await realpath(namedHome), mcpServers: ["kimi-desktop-preview", "named-user", "project-named"] },
+    expect(sessions.map((session) => ({
+      ...session,
+      cwd: comparableTestPath(session.cwd),
+      kimiCodeHome: comparableTestPath(session.kimiCodeHome),
+    }))).toEqual([
+      { cwd: comparableTestPath(resolvedWorkspace), kimiCodeHome: comparableTestPath(await realpath(namedHome)), mcpServers: ["kimi-desktop-preview", "named-user"] },
+      { cwd: comparableTestPath(resolvedWorkspace), kimiCodeHome: comparableTestPath(await realpath(siblingHome)), mcpServers: ["kimi-desktop-preview", "sibling-user"] },
+      { cwd: comparableTestPath(resolvedWorkspace), kimiCodeHome: comparableTestPath(await realpath(namedHome)), mcpServers: ["kimi-desktop-preview", "named-user", "project-named"] },
     ]);
 
     const wslReply = waitFor(socket, messages, (message) => message.id === 8);
