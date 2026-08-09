@@ -1,1 +1,1 @@
-6bfadb35a307c0753fccf35e25f6c32b1d9764518e7a7c6d892dd29e8bf47e39  Kimi-Code-Desktop-0.8.3-x64-setup.exe
+b742395ac80a5495e25cb7a72b5e482a4c47c73d2169e74eef3261fe3adde709  Kimi-Code-0.12.0-x64-setup.exe
