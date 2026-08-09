@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -627,7 +627,7 @@ test("a changed deferred protection branch fails before any command, fetch, or r
 
 test("App private-key loading signs bounded RS256 JWTs and rejects missing, symlink, or invalid keys before network", async () => withWorkspace(async (workspaceRoot) => {
   const manifest = fixtureManifest();
-  const keyDirectory = await mkdtemp(join(tmpdir(), "legacy-feed-app-key-test-"));
+  const keyDirectory = await realpath(await mkdtemp(join(tmpdir(), "legacy-feed-app-key-test-")));
   try {
     const keyPath = join(keyDirectory, "app.pem");
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
